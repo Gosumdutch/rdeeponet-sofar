@@ -300,10 +300,13 @@ class TrunkMLP(nn.Module):
                  act: str = 'gelu',
                  film_layers: Optional[Iterable[int]] = None,
                  cond_dim: Optional[int] = None,
-                 film_gain: float = 1.0):
+                 film_gain: float = 1.0,
+                 cond_mode: str = 'film'):
         super().__init__()
         self.pe = SinusoidalPE(2, L)
-        in_dim = 2 + 4 * L
+        self.cond_mode = (cond_mode or 'film').lower()
+        base_dim = 2 + 4 * L
+        in_dim = base_dim + (int(cond_dim) if (self.cond_mode == 'concat' and cond_dim is not None) else 0)
         self.activation = nn.GELU() if act == 'gelu' else nn.ReLU()
         depth = max(1, int(depth))
         self.hidden_layers = nn.ModuleList()
@@ -323,14 +326,14 @@ class TrunkMLP(nn.Module):
         self.film_gain = float(film_gain)
         self.film_scale = nn.ModuleDict()
         self.film_shift = nn.ModuleDict()
-        if self.film_layers and cond_dim is not None:
+        if self.cond_mode == 'film' and self.film_layers and cond_dim is not None:
             for idx in self.film_layers:
                 if idx >= len(self.hidden_layers):
                     continue
                 key = str(idx)
                 self.film_scale[key] = nn.Linear(int(cond_dim), hidden)
                 self.film_shift[key] = nn.Linear(int(cond_dim), hidden)
-        else:
+        elif self.cond_mode != 'film':
             self.film_layers = []
 
     def forward(self, coords: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -354,14 +357,185 @@ class TrunkMLP(nn.Module):
                 raise ValueError('Mismatch between coords batch and cond batch sizes.')
 
         pe = self.pe(coords)
-        h = pe
+        if self.cond_mode == 'concat' and cond is not None:
+            cond_exp = cond.unsqueeze(1).expand(-1, pe.shape[1], -1)
+            h = torch.cat([pe, cond_exp], dim=-1)
+        else:
+            h = pe
         for idx, layer in enumerate(self.hidden_layers):
             h = layer(h)
             h = self.activation(h)
-            if cond is not None and str(idx) in self.film_scale:
+            if self.cond_mode == 'film' and cond is not None and str(idx) in self.film_scale:
                 scale = torch.tanh(self.film_scale[str(idx)](cond)) * self.film_gain
                 shift = self.film_shift[str(idx)](cond)
                 h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        out = self.output_layer(h)
+        if squeeze_output and (cond is None or cond.shape[0] == 1):
+            out = out.squeeze(0)
+        return out
+
+
+class TrunkFFMLP(nn.Module):
+    """Random Fourier Feature + MLP trunk."""
+    def __init__(self,
+                 K: int = 256,
+                 L: int = 6,
+                 hidden: int = 256,
+                 depth: int = 4,
+                 fourier_dim: int = 256,
+                 fourier_sigma: float = 1.0,
+                 cond_dim: Optional[int] = None,
+                 cond_mode: str = 'film',
+                 film_gain: float = 1.0):
+        super().__init__()
+        self.cond_mode = (cond_mode or 'film').lower()
+        self.film_gain = float(film_gain)
+        base_dim = 2 + 4 * L
+        self.pe = SinusoidalPE(2, L)
+        self.fourier_dim = int(fourier_dim)
+        self.register_buffer('rff_w', torch.randn(base_dim + (cond_dim or 0), self.fourier_dim) / max(1e-6, float(fourier_sigma)))
+        self.register_buffer('rff_b', torch.rand(self.fourier_dim) * 2 * math.pi)
+        in_dim = self.fourier_dim * 2
+        if self.cond_mode == 'concat' and cond_dim is not None:
+            in_dim += cond_dim
+        self.hidden_layers = nn.ModuleList()
+        input_dim = in_dim
+        depth = max(1, int(depth))
+        for _ in range(depth):
+            self.hidden_layers.append(nn.Linear(input_dim, hidden, bias=False))
+            input_dim = hidden
+        self.output_layer = nn.Linear(hidden, K, bias=False)
+
+        raw_layers = []
+        self.film_layers = []
+        self.film_scale = nn.ModuleDict()
+        self.film_shift = nn.ModuleDict()
+        if self.cond_mode == 'film' and cond_dim is not None:
+            raw_layers = list(range(depth))
+            self.film_layers = sorted({int(idx) for idx in raw_layers if int(idx) >= 0})
+            for idx in self.film_layers:
+                key = str(idx)
+                self.film_scale[key] = nn.Linear(int(cond_dim), hidden)
+                self.film_shift[key] = nn.Linear(int(cond_dim), hidden)
+
+    def forward(self, coords: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if coords.dim() == 2:
+            coords = coords.unsqueeze(0)
+            squeeze_output = True
+        elif coords.dim() == 3:
+            squeeze_output = False
+        else:
+            raise ValueError(f'Unsupported coordinate shape: {tuple(coords.shape)}')
+
+        if cond is not None and cond.dim() == 1:
+            cond = cond.unsqueeze(0)
+        if cond is not None and cond.shape[0] != coords.shape[0]:
+            if cond.shape[0] == 1:
+                cond = cond.expand(coords.shape[0], -1)
+            elif coords.shape[0] == 1:
+                coords = coords.expand(cond.shape[0], -1, -1)
+            else:
+                raise ValueError('Mismatch between coords batch and cond batch sizes.')
+
+        pe = self.pe(coords)
+        if cond is not None:
+            pe_cond = torch.cat([pe, cond.unsqueeze(1).expand(-1, pe.shape[1], -1)], dim=-1)
+        elif pe.shape[-1] == self.rff_w.shape[0]:
+            pe_cond = pe
+        else:
+            # cond missing but rff expects extra dims -> pad zeros
+            pad_dim = self.rff_w.shape[0] - pe.shape[-1]
+            pad = torch.zeros(pe.shape[0], pe.shape[1], pad_dim, device=pe.device, dtype=pe.dtype)
+            pe_cond = torch.cat([pe, pad], dim=-1)
+        proj = pe_cond @ self.rff_w  # [B,N,m]
+        feats = torch.cat([torch.sin(proj + self.rff_b), torch.cos(proj + self.rff_b)], dim=-1)
+        h = feats
+        if self.cond_mode == 'concat' and cond is not None:
+            cond_exp = cond.unsqueeze(1).expand(-1, h.shape[1], -1)
+            h = torch.cat([h, cond_exp], dim=-1)
+        for idx, layer in enumerate(self.hidden_layers):
+            h = layer(h)
+            h = torch.relu(h)
+            if self.cond_mode == 'film' and cond is not None and str(idx) in self.film_scale:
+                scale = torch.tanh(self.film_scale[str(idx)](cond)) * self.film_gain
+                shift = self.film_shift[str(idx)](cond)
+                h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        out = self.output_layer(h)
+        if squeeze_output and (cond is None or cond.shape[0] == 1):
+            out = out.squeeze(0)
+        return out
+
+
+class TrunkSIREN(nn.Module):
+    """SIREN trunk with optional FiLM/concat conditioning. Bias disabled."""
+    def __init__(self,
+                 K: int = 256,
+                 hidden: int = 256,
+                 depth: int = 5,
+                 w0: float = 30.0,
+                 cond_dim: Optional[int] = None,
+                 cond_mode: str = 'film',
+                 film_gain: float = 1.0):
+        super().__init__()
+        self.w0 = float(w0)
+        self.cond_mode = (cond_mode or 'film').lower()
+        self.film_gain = float(film_gain)
+        in_dim = 2 + (int(cond_dim) if (self.cond_mode == 'concat' and cond_dim is not None) else 0)
+        self.first = nn.Linear(in_dim, hidden, bias=False)
+        self.hidden_layers = nn.ModuleList()
+        depth = max(1, int(depth))
+        for _ in range(depth - 1):
+            self.hidden_layers.append(nn.Linear(hidden, hidden, bias=False))
+        self.output_layer = nn.Linear(hidden, K, bias=False)
+
+        raw_layers = []
+        self.film_layers = []
+        self.film_scale = nn.ModuleDict()
+        self.film_shift = nn.ModuleDict()
+        if self.cond_mode == 'film' and cond_dim is not None:
+            raw_layers = list(range(depth))
+            self.film_layers = sorted({int(idx) for idx in raw_layers if int(idx) >= 0})
+            for idx in self.film_layers:
+                key = str(idx)
+                self.film_scale[key] = nn.Linear(int(cond_dim), hidden)
+                self.film_shift[key] = nn.Linear(int(cond_dim), hidden)
+
+    def sine(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.w0 * x)
+
+    def forward(self, coords: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if coords.dim() == 2:
+            coords = coords.unsqueeze(0)
+            squeeze_output = True
+        elif coords.dim() == 3:
+            squeeze_output = False
+        else:
+            raise ValueError(f'Unsupported coordinate shape: {tuple(coords.shape)}')
+
+        if cond is not None and cond.dim() == 1:
+            cond = cond.unsqueeze(0)
+        if cond is not None and cond.shape[0] != coords.shape[0]:
+            if cond.shape[0] == 1:
+                cond = cond.expand(coords.shape[0], -1)
+            elif coords.shape[0] == 1:
+                coords = coords.expand(cond.shape[0], -1, -1)
+            else:
+                raise ValueError('Mismatch between coords batch and cond batch sizes.')
+
+        if self.cond_mode == 'concat' and cond is not None:
+            cond_exp = cond.unsqueeze(1).expand(-1, coords.shape[1], -1)
+            h = torch.cat([coords, cond_exp], dim=-1)
+        else:
+            h = coords
+        h = self.first(h)
+        h = self.sine(h)
+        for idx, layer in enumerate(self.hidden_layers):
+            h = layer(h)
+            if self.cond_mode == 'film' and cond is not None and str(idx) in self.film_scale:
+                scale = torch.tanh(self.film_scale[str(idx)](cond)) * self.film_gain
+                shift = self.film_shift[str(idx)](cond)
+                h = h * (1.0 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+            h = self.sine(h)
         out = self.output_layer(h)
         if squeeze_output and (cond is None or cond.shape[0] == 1):
             out = out.squeeze(0)
@@ -382,11 +556,17 @@ class RDeepONetV2(nn.Module):
                  branch_params: Optional[Dict[str, Any]] = None,
                  branch_out_dim: int = 512,
                  film_layers: Optional[Iterable[int]] = None,
-                 film_gain: float = 1.0):
+                 film_gain: float = 1.0,
+                 trunk_type: str = 'mlp',
+                 trunk_cond_mode: str = 'film',
+                 trunk_fourier_dim: int = 256,
+                 trunk_fourier_sigma: float = 1.0,
+                 trunk_w0: float = 30.0):
         super().__init__()
         branch_params = dict(branch_params or {})
         self.branch_variant = branch_variant
         self.branch_out_dim = int(branch_out_dim)
+        self.trunk_type = (trunk_type or 'mlp').lower()
 
         self.branch_cnn = BranchCNN(
             out_dim=self.branch_out_dim,
@@ -397,16 +577,43 @@ class RDeepONetV2(nn.Module):
         )
         self.branch_cond = BranchCond(hidden_dim=cond_hidden, out_dim=cond_out)
         self.branch_proj = nn.Linear(self.branch_out_dim + cond_out, K)
-        self.trunk = TrunkMLP(
-            K=K,
-            L=L,
-            hidden=hidden,
-            depth=depth,
-            film_layers=film_layers,
-            cond_dim=cond_out,
-            film_gain=film_gain,
-            act='gelu'
-        )
+
+        if self.trunk_type in ('mlp', 'mlp_pe', 'baseline'):
+            self.trunk = TrunkMLP(
+                K=K,
+                L=L,
+                hidden=hidden,
+                depth=depth,
+                film_layers=film_layers,
+                cond_dim=cond_out,
+                film_gain=film_gain,
+                act='gelu',
+                cond_mode=trunk_cond_mode
+            )
+        elif self.trunk_type in ('ff', 'ffmlp', 'rff'):
+            self.trunk = TrunkFFMLP(
+                K=K,
+                L=L,
+                hidden=hidden,
+                depth=depth,
+                fourier_dim=trunk_fourier_dim,
+                fourier_sigma=trunk_fourier_sigma,
+                cond_dim=cond_out,
+                cond_mode=trunk_cond_mode,
+                film_gain=film_gain
+            )
+        elif self.trunk_type in ('siren',):
+            self.trunk = TrunkSIREN(
+                K=K,
+                hidden=hidden,
+                depth=depth,
+                w0=trunk_w0,
+                cond_dim=cond_out,
+                cond_mode=trunk_cond_mode,
+                film_gain=film_gain
+            )
+        else:
+            raise ValueError(f"Unsupported trunk_type: {self.trunk_type}")
 
     def forward_full(self, ray: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         b_img = self.branch_cnn(ray)

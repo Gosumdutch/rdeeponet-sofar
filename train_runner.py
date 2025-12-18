@@ -23,6 +23,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 try:
     import optuna  # optional for pruning integration
 except Exception:
@@ -39,7 +42,7 @@ from training_utils import (
     build_regression_loss, build_scheduler, resolve_gradient_clip, 
     WarmupCosineScheduler, loss_tensor,
     LossComposer, PhysicsLossConfig, build_physics_loss_config,
-    compute_reciprocity_loss, compute_smoothness_fd
+    compute_reciprocity_loss, compute_smoothness_fd, compute_gradient_map_fd
 )
 
 def build_ema_model(model: nn.Module) -> nn.Module:
@@ -75,6 +78,71 @@ def build_norm_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def assert_preproc_match(train_ds: RDeepONetH5, val_ds: RDeepONetH5, outdir: Path) -> None:
+    issues = []
+    if train_ds.norm != val_ds.norm:
+        issues.append({'type': 'norm_mismatch', 'train': train_ds.norm, 'val': val_ds.norm})
+    keys = ['sampler_strategy', 'edge_ratio', 'grad_threshold', 'edge_weight_scale']
+    for k in keys:
+        if getattr(train_ds, k, None) != getattr(val_ds, k, None):
+            issues.append({'type': 'sampler_mismatch', 'key': k,
+                           'train': getattr(train_ds, k, None),
+                           'val': getattr(val_ds, k, None)})
+    if issues:
+        outdir.mkdir(parents=True, exist_ok=True)
+        with open(outdir / 'failure_preproc.json', 'w') as f:
+            json.dump({'issues': issues}, f, indent=2)
+        raise RuntimeError(f"Train/val preprocessing mismatch: {issues}")
+
+
+def save_debug_figures(model: nn.Module,
+                       batch: Dict[str, torch.Tensor],
+                       outdir: Path,
+                       device: torch.device,
+                       tl_min: float,
+                       tl_max: float) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+    figures_dir = outdir / 'figures'
+    figures_dir.mkdir(exist_ok=True)
+    ray = batch['ray'].to(device)
+    cond = batch['cond'].to(device)
+    tl_gt = batch['tl'].to(device)
+    tl_pred = infer_full_map(model, ray, cond, device=device)
+    if tl_pred.dim() == 3:
+        tl_pred = tl_pred[0]
+    tl_pred = tl_pred.detach().cpu()
+    tl_gt = tl_gt[0].cpu() if tl_gt.dim() == 4 else tl_gt.cpu()
+    diff = (tl_pred - tl_gt).abs()
+
+    grad_map = compute_gradient_map_fd(model, ray.to(device), cond.to(device), device=device).cpu()
+    # simple spectral high-freq energy
+    pred_np = tl_pred.numpy()
+    fft2 = np.fft.fftshift(np.fft.fft2(pred_np))
+    mag = np.abs(fft2)
+    h, w = mag.shape
+    center = (h // 2, w // 2)
+    radius = min(center)
+    mask = np.ones_like(mag, dtype=bool)
+    rr, cc = np.ogrid[:h, :w]
+    mask[(rr - center[0]) ** 2 + (cc - center[1]) ** 2 <= (0.25 * radius) ** 2] = False
+    hf_energy = mag[mask].sum() / (mag.sum() + 1e-8)
+
+    def _imshow(ax, data, title):
+        im = ax.imshow(data, cmap='viridis', origin='lower', vmin=0, vmax=1)
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    _imshow(axes[0], tl_gt, 'GT')
+    _imshow(axes[1], tl_pred, 'Pred')
+    _imshow(axes[2], diff, 'Abs Diff')
+    _imshow(axes[3], grad_map, 'Grad |∇|')
+    fig.suptitle(f'High-freq energy: {hf_energy:.4f}')
+    fig.tight_layout()
+    fig.savefig(figures_dir / 'debug_maps.png', dpi=200)
+    plt.close(fig)
+
+
 def make_datasets(cfg: Dict[str, Any], split_ratio: Dict[str, float], overrides: Optional[Dict[str, Any]] = None) -> Tuple[RDeepONetH5, RDeepONetH5]:
     data_cfg = cfg['data']
     norm_cfg = build_norm_cfg(cfg)
@@ -91,6 +159,10 @@ def make_datasets(cfg: Dict[str, Any], split_ratio: Dict[str, float], overrides:
             sampler_cfg['grad_threshold'] = overrides['sampler_grad_threshold']
         if 'sampler_weight_scale' in overrides:
             sampler_cfg['weight_scale'] = overrides['sampler_weight_scale']
+        if 'edge_weight_scale' in overrides:
+            sampler_cfg['weight_scale'] = overrides['edge_weight_scale']
+        if 'grad_threshold' in overrides:
+            sampler_cfg['grad_threshold'] = overrides['grad_threshold']
         if overrides.get('sampler_enabled') is False:
             sampler_cfg['strategy'] = 'uniform'
             sampler_cfg['enabled'] = False
@@ -175,6 +247,11 @@ def build_model(cfg: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None)
     film_layers_cfg = ov.get('trunk_film_layers', trunk_cfg.get('film_layers'))
     film_layers = _parse_int_sequence(film_layers_cfg)
     film_gain = float(ov.get('trunk_film_gain', trunk_cfg.get('film_gain', 1.0)))
+    trunk_type = str(ov.get('trunk_type', trunk_cfg.get('type', 'mlp'))).lower()
+    trunk_cond_mode = str(ov.get('trunk_cond_mode', trunk_cfg.get('cond_mode', 'film'))).lower()
+    trunk_fourier_dim = int(ov.get('trunk_fourier_dim', trunk_cfg.get('fourier_dim', 256)))
+    trunk_fourier_sigma = float(ov.get('trunk_fourier_sigma', trunk_cfg.get('fourier_sigma', 1.0)))
+    trunk_w0 = float(ov.get('trunk_w0', trunk_cfg.get('w0', 30.0)))
 
     for key, value in ov.items():
         if not key.startswith('branch_') or key == 'branch_variant':
@@ -204,6 +281,11 @@ def build_model(cfg: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None)
         branch_out_dim=branch_out_dim,
         film_layers=film_layers or None,
         film_gain=film_gain,
+        trunk_type=trunk_type,
+        trunk_cond_mode=trunk_cond_mode,
+        trunk_fourier_dim=trunk_fourier_dim,
+        trunk_fourier_sigma=trunk_fourier_sigma,
+        trunk_w0=trunk_w0
     )
 
     freeze_cfg = ov.get('freeze_layers', m.get('freeze_layers', 'none'))
@@ -298,7 +380,9 @@ def fit_one_trial(cfg: Dict[str, Any],
                   trial: Any = None,
                   prune_interval: int = 5,
                   grace_epochs: int = 40,
-                  patience: int = 30) -> Dict[str, Any]:
+                  patience: int = 30,
+                  force_no_physics: bool = False,
+                  force_amp: bool = False) -> Dict[str, Any]:
     train_cfg = cfg['training']
     eval_cfg = cfg.get('evaluation', {})
 
@@ -335,11 +419,24 @@ def fit_one_trial(cfg: Dict[str, Any],
     else:
         torch.set_num_threads(4)
 
+    outdir = Path((overrides or {}).get('outdir', cfg.get('output_dir', 'experiments/rdeeponet_v2_run1')))
+    outdir.mkdir(parents=True, exist_ok=True)
+    resolved_cfg_path = outdir / 'config_resolved.yaml'
+    try:
+        with open(resolved_cfg_path, 'w', encoding='utf-8') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False)
+        if overrides:
+            with open(outdir / 'overrides.json', 'w', encoding='utf-8') as f:
+                json.dump(overrides, f, indent=2)
+    except Exception:
+        pass
+
     accelerator = train_cfg.get('accelerator', 'cuda')
     device = torch.device('cuda' if (accelerator == 'cuda' and torch.cuda.is_available()) else 'cpu')
 
     split_ratio = {'train': 0.8, 'val': 0.2}
     train_ds, val_ds_full = make_datasets(cfg, split_ratio, overrides)
+    assert_preproc_match(train_ds, val_ds_full, outdir)
     batch_size = int((overrides or {}).get('batch_size', train_cfg.get('batch_size', 8)))
     train_loader, val_loader_full = make_loaders(cfg, train_ds, val_ds_full, batch_size, num_workers)
 
@@ -410,6 +507,12 @@ def fit_one_trial(cfg: Dict[str, Any],
         if 'smooth_delta' in overrides:
             physics_cfg.smooth_delta = float(overrides['smooth_delta'])
     
+    if force_no_physics:
+        reciprocity_weight = 0.0
+        smooth_weight = 0.0
+        tv_weight = 0.0
+        physics_cfg.enabled = False
+
     # Build LossComposer for physics-informed training
     loss_composer = LossComposer(
         lambda_val=primary_weight,
@@ -427,8 +530,10 @@ def fit_one_trial(cfg: Dict[str, Any],
     if overrides and 'use_amp' in overrides:
         use_amp_flag = overrides['use_amp']
     amp_enabled = bool(use_amp_flag and device.type == 'cuda')
-    # Note: Modern PyTorch AMP (1.10+) handles Huber/SmoothL1 loss stably
-    # Removed MSE-only restriction for AMP
+    if primary_loss_name != 'mse':
+        amp_enabled = False
+    if force_amp:
+        amp_enabled = True
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     clip_cfg = resolve_gradient_clip(train_cfg)
@@ -449,9 +554,6 @@ def fit_one_trial(cfg: Dict[str, Any],
 
     best_mae = float('inf')
     best_mae_percent = float('inf')
-    outdir = Path((overrides or {}).get('outdir', cfg.get('output_dir', 'experiments/rdeeponet_v2_run1')))
-    outdir.mkdir(parents=True, exist_ok=True)
-
     metrics_rows: list[Dict[str, Any]] = []
     step_count = 0
     epochs_since_improve = 0
@@ -703,6 +805,11 @@ def fit_one_trial(cfg: Dict[str, Any],
             if ema_model is not None:
                 checkpoint['ema_state_dict'] = ema_model.state_dict()
             torch.save(checkpoint, outdir / 'best.pt')
+            try:
+                first_val_batch = next(iter(val_loader_full))
+                save_debug_figures(eval_model, first_val_batch, outdir, device, tl_min, tl_max)
+            except Exception:
+                pass
             epochs_since_improve = 0
 
         # Save periodic checkpoint every 10 epochs
@@ -748,6 +855,12 @@ def fit_one_trial(cfg: Dict[str, Any],
             for row in metrics_rows:
                 writer.writerow(row)
                 final_epoch = row['epoch']
+    try:
+        with open(outdir / 'metrics_best.json', 'w') as f:
+            json.dump({'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent,
+                       'final_epoch': final_epoch}, f, indent=2)
+    except Exception:
+        pass
 
     return {'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent, 'final_epoch': final_epoch}
 
