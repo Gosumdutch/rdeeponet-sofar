@@ -1,35 +1,34 @@
+# Data (upload separately via Google Drive)
+R-DeepONet_Data/
+data_h5.zip
+*.h5
+*.npy
+
+# Experiments & checkpoints
+experiments/
+mlruns/
+backup_essential/
+*.pt
+*.pth
+
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 .Python
-*.so
-.pytest_cache/
-
-# Data (vast.ai에서 재생성 또는 별도 다운로드)
-R-DeepONet_Data/
-at/
-*.h5
-*.npy
-*.png
-
-# Experiments (vast.ai에서 재실행)
-experiments/
-backup_essential/
-mlruns/
-
-# OS
-.DS_Store
-Thumbs.db
+*.egg-info/
+.eggs/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
+.cursor/
 
-# Logs
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+vast_upload/
 *.log
-training_log.jsonl
-failure_log.json
+*.tmp

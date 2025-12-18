@@ -136,8 +136,7 @@ def main():
 
     use_amp = bool(cfg['training'].get('use_amp', (cfg['training'].get('accelerator', 'cuda') == 'cuda')))
     amp_enabled = use_amp and (cfg['training'].get('accelerator', 'cuda') == 'cuda')
-    if primary_loss_name != 'mse':
-        amp_enabled = False
+    # Note: Modern PyTorch AMP (1.10+) handles Huber/SmoothL1 loss stably
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     clip_cfg = resolve_gradient_clip(cfg['training'])

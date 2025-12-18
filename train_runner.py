@@ -427,8 +427,8 @@ def fit_one_trial(cfg: Dict[str, Any],
     if overrides and 'use_amp' in overrides:
         use_amp_flag = overrides['use_amp']
     amp_enabled = bool(use_amp_flag and device.type == 'cuda')
-    if primary_loss_name != 'mse':
-        amp_enabled = False
+    # Note: Modern PyTorch AMP (1.10+) handles Huber/SmoothL1 loss stably
+    # Removed MSE-only restriction for AMP
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     clip_cfg = resolve_gradient_clip(train_cfg)

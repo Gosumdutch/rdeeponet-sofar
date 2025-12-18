@@ -17,8 +17,8 @@ data:
 
 training:
   epochs: 60
-  batch_size: 4
-  num_workers: 2
+  batch_size: 16           # optimized for RTX 4090
+  num_workers: 4
   accelerator: cuda
   gradient_clip:
     enabled: true
