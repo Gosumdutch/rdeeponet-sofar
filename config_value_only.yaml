@@ -1,0 +1,82 @@
+# Value-Only Baseline Configuration
+# All physics-informed loss terms are disabled (λ = 0)
+# This config should reproduce results from before physics loss implementation
+
+data:
+  path: R-DeepONet_Data/data/h5
+  mode: coord
+  pts_per_map: 8192
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+  sampler:
+    strategy: edge_focus
+    edge_ratio: 0.7
+    grad_threshold: 0.05
+    weight_scale: 1.0
+
+training:
+  epochs: 60
+  batch_size: 4
+  num_workers: 2
+  accelerator: cuda
+  gradient_clip:
+    enabled: true
+    max_norm: 3.0
+    norm_type: 2.0
+  use_amp: true
+  early_stopping_patience: 15
+  grace_epochs: 25
+  ema:
+    enabled: true
+    decay: 0.999
+
+model:
+  name: RDeepONetV2
+  branch_cnn:
+    name: resnet18
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 512
+    num_layers: 9
+  final_projection_dim: 320
+  positional_L: 10
+  dropout: 0.08
+  freeze_layers: layer1
+
+optimizer:
+  name: AdamW
+  lr: 0.0008
+  weight_decay: 1.0e-06
+
+scheduler:
+  name: WarmupCosine
+  warmup_epochs: 10
+  T_max: 60
+  eta_min: 6.4e-05
+  eta_min_ratio: 0.08
+
+loss:
+  type: huber
+  huber_delta: 1.0
+
+# VALUE-ONLY: All physics terms disabled
+loss_weights:
+  value: 1.0
+  reciprocity: 0.0    # OFF - no reciprocity constraint
+  smooth: 0.0         # OFF - no smoothness penalty
+  tv: 0.0             # OFF - no total variation
+
+# Physics loss disabled
+physics_loss:
+  enabled: false      # Master switch OFF
+
+output_dir: experiments/value_only_baseline
+evaluation:
+  check_consistency: true
+seed: 42
+

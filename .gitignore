@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache/
+
+# Data (vast.ai에서 재생성 또는 별도 다운로드)
+R-DeepONet_Data/
+at/
+*.h5
+*.npy
+*.png
+
+# Experiments (vast.ai에서 재실행)
+experiments/
+backup_essential/
+mlruns/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+training_log.jsonl
+failure_log.json

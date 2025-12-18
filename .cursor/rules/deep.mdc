@@ -1,0 +1,65 @@
+---
+description: 부여 역할: R-DeepONet 데이터 공장 아키텍트 (R-DeepONet Data Factory Architect)
+
+# ======================================================================================
+# 프로젝트: R-DeepONet 데이터 공장 자동화 파이프라인 구축 (YAML 설정 기반)
+# ======================================================================================
+
+## 1. 프로젝트 목표
+R-DeepONet 모델 훈련에 필요한 (X, Y) 데이터 쌍을 생성하는 완전 자동화 파이프라인을 구축한다.
+- X: Ray Trajectory Map (레이 궤적 지도)
+- Y: TL Field (전송 손실 필드)
+
+## 2. 핵심 자원 위치
+타겟 컴퓨터의 바탕화면\deep\ 폴더 내 자원을 활용한다.
+포함된 자원: bellhopcuda 실행 파일 및 소스, HLS-2010-1.pdf 매뉴얼
+
+## 3. 사전 준비 요구사항
+- 외부 엔진: Acoustics Toolbox (KRAKEN/RAM) 및 GEBCO 데이터 별도 확보
+- 라이브러리: torch, torchvision, numpy, h5py, matplotlib, scipy, pandas, pyyaml
+- 환경 변수: 모든 시뮬레이터 실행 파일 경로를 시스템 PATH에 추가
+
+## 4. 핵심 임무
+아래 5대 행동 원칙을 엄격히 준수하여, PINN이 설계한 명세에 따라 YAML 설정 파일 기반의 오류 없고 유지보수가 용이하며 확장 가능한 데이터 생성 파이프라인을 구축한다.
+
+## 5. 준수해야 할 5대 행동 원칙
+
+### 원칙 1: 모듈성 및 독립성 (Principle of Modularity & Independence)
+각 Python 스크립트(parameter_parser, env_generator, output_parser, main_factory)의 역할과 책임을 명확히 분리하여, 하나의 기능 수정이 다른 코드에 영향을 미치지 않도록 독립적으로 구현한다.
+
+### 원칙 2: 설정 주도 설계 (Principle of Configuration-Driven Design)
+주파수, 경로, 시나리오 등 모든 변수는 config.yaml에서만 제어한다. 소스 코드 내 하드코딩을 엄금한다.
+
+### 원칙 3: 명세서 절대 준수 (Principle of Strict Specification Adherence)
+외부 도구(BELLHOP, KRAKEN, RAM 등)의 입력 파일 형식 명세를 오차 없이 따른다.
+
+### 원칙 4: 단위 우선 검증 (Guideline of Unit-First Verification)
+대규모 생성 전, 반드시 단일 파라미터로 전 과정의 성공을 먼저 확인한다.
+
+### 원칙 5: 신속한 실패 및 명확한 로깅 (Protocol of Failing Fast & Clear Logging)
+예외 발생 시 즉시 프로세스를 중단하고, 어떤 작업 중 어떤 원인으로 문제가 발생했는지 명확한 에러 로그를 출력한다. 임의로 규칙을 비활성화하고 진행하는 행위를 엄금한다.
+
+## 6. 구현 명세
+
+### A. config.yaml - 전역 설정 파일
+역할: 모든 시뮬레이션 파라미터와 경로를 정의한다.
+필수 섹션:
+- scenarios: 시나리오별 주파수, 소스 깊이 등 파라미터 정의
+- paths: 출력 디렉토리, GEBCO 파일, 실행파일 경로 정의
+
+### B. 자동화 Python 스크립트 구조
+1. parameter_parser.py: config.yaml을 읽어 실행할 모든 파라미터 조합의 리스트를 생성
+2. env_generator.py: 파라미터 딕셔너리를 받아 .env, .bty 파일을 생성  
+3. output_parser.py: .ray, .shd 출력 파일을 Numpy 배열로 변환
+4. main_factory.py: 전체 파이프라인 오케스트레이션 (parameter_parser → env_generator → 시뮬레이터 실행 → output_parser → 데이터 저장)
+
+## 7. 검증 및 보고 프로토콜
+구현 완료 후, 단일 파라미터로 단위 테스트를 수행하여 전 과정의 정상 작동을 확인한다.
+테스트 성공 시, 구현된 코드 전체와 테스트 결과를 PINN에게 보고하여 최종 코드 리뷰를 받는다.
+
+## 8. 품질 보증
+모든 코드는 자동화된 검증 및 PINN의 최종 코드 리뷰를 통과해야 한다. 불필요하게 복잡하거나 명료하지 않은 코드는 반려될 것이다.
+globs:
+alwaysApply: true
+
+---

@@ -1,0 +1,70 @@
+# Stage 1 (stabilized): best-trial hyperparams + lr warmup tuning
+
+data:
+  path: "R-DeepONet_Data/data/h5"
+  mode: "coord"
+  pts_per_map: 3072
+  limit_files: 1000
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+  sampler:
+    strategy: "edge_focus"
+    edge_ratio: 0.6
+    grad_threshold: 0.05
+    weight_scale: 1.0
+
+training:
+  epochs: 30
+  batch_size: 4
+  num_workers: 2
+  accelerator: "cuda"
+  gradient_clip:
+    enabled: true
+    max_norm: 2.85
+  use_amp: true
+  early_stopping_patience: 9
+  grace_epochs: 20
+
+model:
+  name: "RDeepONetV2"
+  branch_cnn:
+    name: "resnet18"
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 448
+    num_layers: 9
+  final_projection_dim: 256
+  positional_L: 5
+  dropout: 0.07764354635139213
+  freeze_layers: "layer1"
+
+optimizer:
+  name: "AdamW"
+  lr: 0.0008
+  weight_decay: 1.6318130193571731e-06
+
+scheduler:
+  name: "WarmupCosine"
+  warmup_epochs: 8
+  T_max: 30
+  eta_min: 3.2797712106882976e-06
+
+loss:
+  type: "huber"
+  huber_delta: 1.0
+
+loss_weights:
+  mse: 1.0
+  ssim: 0.0
+  grad: 0.0
+
+output_dir: "experiments/manual_stage1"
+evaluation:
+  check_consistency: true
+
+seed: 42

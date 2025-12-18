@@ -1,0 +1,48 @@
+# --- full training config (5120 datasets) ---
+
+data:
+  path: "R-DeepONet_Data/data/h5"
+  mode: "coord"          # Phase 1: coord로 베이스라인 구축 (빠름)
+  pts_per_map: 4096
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+
+training:
+  epochs: 200
+  early_stopping_patience: 15
+  batch_size: 8
+  num_workers: 4
+  accelerator: "cuda"      # 다른 워크스테이션이 CPU 위주면 "cpu"
+  gradient_clip_val: 1.0
+
+model:
+  name: "RDeepONetV2"
+  branch_cnn:
+    name: "resnet18"
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 256
+    num_layers: 6
+  final_projection_dim: 256
+
+optimizer:
+  name: "AdamW"
+  lr: 0.001
+  weight_decay: 0.0003
+
+scheduler:
+  name: "CosineAnnealingLR"
+  T_max: 200
+  eta_min: 0.00001
+
+loss_weights:
+  mse: 1.0
+  ssim: 0.0    # Phase 2에서 full 모드로 전환 후 활성화 권장
+  grad: 0.0
+
+output_dir: "experiments/rdeeponet_v2_full"

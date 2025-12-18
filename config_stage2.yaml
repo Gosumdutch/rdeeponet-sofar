@@ -1,0 +1,70 @@
+# Stage 2 (stabilized): widened trunk + higher resolution coords
+
+data:
+  path: "R-DeepONet_Data/data/h5"
+  mode: "coord"
+  pts_per_map: 4096
+  limit_files: 1000
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+  sampler:
+    strategy: "edge_focus"
+    edge_ratio: 0.6
+    grad_threshold: 0.05
+    weight_scale: 1.0
+
+training:
+  epochs: 45
+  batch_size: 4
+  num_workers: 2
+  accelerator: "cuda"
+  gradient_clip:
+    enabled: true
+    max_norm: 2.8
+  use_amp: true
+  early_stopping_patience: 12
+  grace_epochs: 25
+
+model:
+  name: "RDeepONetV2"
+  branch_cnn:
+    name: "resnet18"
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 512
+    num_layers: 9
+  final_projection_dim: 320
+  positional_L: 6
+  dropout: 0.085
+  freeze_layers: "layer1"
+
+optimizer:
+  name: "AdamW"
+  lr: 0.0008
+  weight_decay: 1.6318130193571731e-06
+
+scheduler:
+  name: "WarmupCosine"
+  warmup_epochs: 8
+  T_max: 45
+  eta_min: 2.0e-06
+
+loss:
+  type: "huber"
+  huber_delta: 1.0
+
+loss_weights:
+  mse: 1.0
+  ssim: 0.0
+  grad: 0.0
+
+output_dir: "experiments/manual_stage2"
+evaluation:
+  check_consistency: true
+
+seed: 42

@@ -1,0 +1,91 @@
+# --- R-DeepONet Training Configuration ---
+
+# 1. ??? ??
+data:
+  path: "R-DeepONet_Data/data/h5"
+  mode: "coord"  # 'coord' ?? 'full'
+  pts_per_map: 1024
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+  sampler:
+    enabled: true
+    strategy: "edge_focus"
+    edge_ratio: 0.6
+    grad_threshold: 0.05
+    weight_scale: 1.0
+
+# 2. ?? ??
+training:
+  epochs: 100
+  batch_size: 8
+  num_workers: 4
+  accelerator: "cuda"
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+  use_amp: true
+
+# 3. ?? ??
+model:
+  name: "RDeepONetV2"
+  branch_cnn:
+    name: "resnet18"
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 256
+    num_layers: 6
+  final_projection_dim: 256
+
+# 4. ??? ??
+optimizer:
+  name: "AdamW"
+  lr: 0.001
+  weight_decay: 0.01
+scheduler:
+  name: "WarmupCosine"
+  warmup_epochs: 3
+  T_max: 100
+  eta_min: 0.00001
+
+# 5. Loss Configuration
+loss:
+  type: "huber"  # 'mse', 'huber', 'smooth_l1'
+  huber_delta: 1.0
+
+# Loss weights for value-only baseline (all physics terms = 0)
+loss_weights:
+  value: 1.0           # Primary value loss weight
+  reciprocity: 0.0     # Physical reciprocity constraint (0 = off)
+  smooth: 0.0          # Smoothness penalty (0 = off)
+  tv: 0.0              # Total variation (backward compat, 0 = off)
+
+# Physics-informed loss configuration
+physics_loss:
+  enabled: true              # Master switch for physics terms
+  warmup_epochs: 15          # Physics loss activates after this epoch
+  warmup_type: "linear"      # linear | cosine
+  auto_scale: true           # EMA-based loss term scaling
+  scale_ema_decay: 0.99      # EMA decay for scale calibration
+  
+  # Reciprocity: TL(r, z_r | z_s) = TL(r, z_s | z_r)
+  reciprocity:
+    n_samples: 64            # Coordinate pairs per batch
+    skip_invalid: true       # Skip out-of-domain swaps
+    
+  # Smoothness: ||grad TL||^2 penalty (finite difference)
+  smooth:
+    delta: 0.00390625        # FD step size (1/256 for 256x256 grid)
+    n_samples: 128           # Points to sample for gradient
+
+# 6. Output Configuration
+output_dir: "experiments/rdeeponet_v2_run1"
+evaluation:
+  check_consistency: true
+  
+# Seed for reproducibility
+seed: 42

@@ -1,0 +1,109 @@
+﻿# R-DeepONet Full-Data Narrow HPO Configuration
+
+data:
+  path: "R-DeepONet_Data/data/h5"
+  mode: "coord"
+  pts_per_map: 12288
+  normalization:
+    tl_min: 40.0
+    tl_max: 120.0
+  sampler:
+    strategy: "edge_focus"
+    edge_ratio: 0.5
+    grad_threshold: 0.05
+    weight_scale: 1.0
+
+training:
+  epochs: 110
+  batch_size: 16
+  num_workers: 4
+  accelerator: "cuda"
+  gradient_clip:
+    enabled: true
+    max_norm: 5.0
+    norm_type: 2.0
+  accumulate_steps: 1
+  use_amp: true
+  ema:
+    enabled: true
+    decay: 0.999
+    eval_with_ema: true
+
+model:
+  name: "RDeepONetV2"
+  branch_cnn:
+    name: "resnet18"
+    pretrained: true
+    output_dim: 512
+  branch_cond:
+    hidden_dim: 128
+    output_dim: 64
+  trunk:
+    hidden_dim: 320
+    num_layers: 9
+  final_projection_dim: 320
+  dropout: 0.05
+  positional_L: 10
+
+
+optimizer:
+  name: "AdamW"
+  lr: 0.0008
+  weight_decay: 0.01
+
+scheduler:
+  name: "WarmupCosine"
+  warmup_epochs: 8
+  T_max: 110
+  eta_min_ratio: 0.1
+
+loss:
+  type: "huber"
+  huber_delta: 0.5
+
+loss_weights:
+  mse: 1.0
+  grad: 0.0
+  ssim: 0.0
+  reciprocity: 0.0
+
+hpo:
+  timeout_hours: 24.0
+  n_startup_trials: 8
+  n_trials: 30
+  study_name: "rdeeponet_fulldata_focus"
+  storage: "sqlite:///experiments/optuna/rdeeponet_fulldata_focus.db"
+  sampler:
+    name: "TPESampler"
+    multivariate: true
+    n_ei_candidates: 50
+    seed: 42
+  pruner:
+    name: "SuccessiveHalving"
+    min_resource: 40
+    reduction_factor: 3
+    min_early_stopping_rate: 0
+  oom_fallback:
+    enabled: true
+    batch_size_candidates: [16, 8, 4]
+    pts_per_map_candidates: [12288, 11264, 10240, 8192, 6144]
+
+output:
+  base_dir: "experiments/optuna"
+  save_top_k: 10
+  save_artifacts: true
+
+logging:
+  mlflow:
+    tracking_uri: "mlruns"
+    experiment_name: "rdeeponet_fulldata_focus"
+  optuna:
+    log_level: "INFO"
+
+dashboard:
+  auto_start: true
+  port_range: [8080, 8090]
+  open_browser: false
+
+evaluation:
+  check_consistency: true

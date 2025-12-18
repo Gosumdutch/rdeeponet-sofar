@@ -1,0 +1,285 @@
+# [FINAL] R-DeepONet Data Production Configuration
+# ======================================================================================
+# Project R-DeepONet 데이터 대량 생산 개시
+# Total target: 1,009 datasets (9 JASA + 1,000 Defense)
+# python main_factory.py --config config.yaml
+# python main_factory.py --config config.yaml --resume
+# 
+# python train.py --config config_train_full.yaml
+# python main_factory.py --config config.yaml --start_idx 4083 --resume
+# ======================================================================================
+
+# Project settings
+project:
+  name: "R-DeepONet_Production_Campaign"
+  version: "1.0.0"
+  description: "Final production campaign for R-DeepONet training data"
+  output_directory: "R-DeepONet_Data_1200"
+  data_format: "hdf5"
+
+# 1. 시뮬레이션 물리 공간 정의
+simulation_space:
+  max_range_km: 100
+  max_depth_m: 5000
+  grid_resolution: [256, 256]  # [깊이, 거리] - Production
+
+# Data structure organization
+data_structure:
+  main_data_dir: "data"                  # HDF5 files with training data
+  images_dir: "images"                   # PNG visualizations (300 DPI)
+  subdirectories:
+    branch_inputs: "branch_inputs"       # [frequency, source_depth] parameters  
+    trunk_coordinates: "trunk_coordinates" # [range, depth] coordinates
+    ray_maps: "ray_maps"                 # Ray density maps (CNN input)
+    tl_targets: "tl_targets"             # KRAKEN/SCOOTER TL values (ground truth)
+
+# 2. 데이터 생성 시나리오 정의
+scenarios:
+  # ===================================================================================
+  # SCENARIO 1: JASA_Benchmark (Wang et al. 2024 직접 비교 검증)
+  # ===================================================================================
+  - name: "JASA_Benchmark"
+    enabled: false
+    description: "Wang et al. (2024) paper direct comparison validation"
+    target_count: 5120  # 256 freqs × 20 source depths
+    ground_truth_model: "KRAKEN"
+    
+    # Frequency specification: 256 log-spaced
+    frequencies:
+      start: 20
+      stop: 10000
+      num: 256
+      scale: "log"
+      unit: "Hz"
+    
+    # Source depth: 20 values (m)
+    source_depths:
+      values: [50, 250, 450, 650, 850, 1050, 1250, 1450, 1650, 1850, 2050, 2250, 2450, 2650, 2850, 3050, 3250, 3450, 3650, 4000]
+      unit: "m"
+    
+    # Models
+    ray_model: "BELLHOP"     # Problem generator
+    tl_model: "KRAKEN"       # Ground truth generator
+    
+    # Physical space (unified across all scenarios)
+    ranges:
+      start: 0.0
+      stop: 100.0
+      num: 256
+      unit: "km"
+    
+    receiver_depths:
+      start: 0.0  
+      stop: 5000.0
+      num: 256
+      unit: "m"
+      
+    beam_angles:
+      start: -30
+      stop: 30
+      num: 361
+      unit: "degrees"
+
+  # ===================================================================================  
+  # SCENARIO 2: Defense_Wideband (방산 응용 범용 연산자 훈련)
+  # ===================================================================================
+  - name: "Defense_Wideband"
+    enabled: false
+    description: "Defense applications universal operator training"
+    target_count: 1000
+    ground_truth_model: "SCOOTER"
+    frequencies:
+      values: [500]
+      unit: "Hz"
+    source_depths:
+      values: [100]
+      unit: "m"
+    ray_model: "BELLHOP"
+    tl_model: "SCOOTER"
+    ranges:
+      start: 0.0
+      stop: 100.0
+      num: 256
+      unit: "km"
+    receiver_depths:
+      start: 0.0
+      stop: 200.0  
+      num: 256
+      unit: "m"
+    beam_angles:
+      start: -30
+      stop: 30
+      num: 361
+      unit: "degrees"
+
+  - name: "Defense_Sweep_2250m"
+    enabled: true
+    description: "Wideband sweep up to 2250 m source depth"
+    ground_truth_model: "SCOOTER"
+    ray_model: "BELLHOP"
+    tl_model: "SCOOTER"
+
+    # Frequencies: previous sweep range (adjust start/stop if needed)
+    frequencies:
+      start: 20
+      stop: 10000
+      num: 100
+      scale: "log"
+      unit: "Hz"
+
+    # Source depths up to 2250 m
+    source_depths:
+      start: 50
+      stop: 2250
+      step: 200
+      unit: "m"
+
+    ranges:
+      start: 0.0
+      stop: 100.0
+      num: 256
+      unit: "km"
+
+    receiver_depths:
+      start: 0.0
+      stop: 200.0
+      num: 256
+      unit: "m"
+
+    beam_angles:
+      start: -30
+      stop: 30
+      num: 361
+      unit: "degrees"
+
+  - name: "Munk_Profile_Benchmark"
+    enabled: false
+    description: "Manual Munk profile benchmark (50Hz, Sd=1000m)"
+    ground_truth_model: "KRAKEN"
+    ray_model: "BELLHOP"
+
+    simulation_space:
+      max_range_km: 100
+      max_depth_m: 5000
+      grid_resolution: [256, 256]
+
+    frequencies:
+      values: [50]
+      unit: "Hz"
+
+    source_depths:
+      values: [1000]
+      unit: "m"
+
+    ranges:
+      start: 0.0
+      stop: 100.0
+      num: 256
+      unit: "km"
+
+    receiver_depths:
+      start: 0.0
+      stop: 5000.0
+      num: 256
+      unit: "m"
+
+    beam_angles:
+      start: -20
+      stop: 20
+      num: 101
+      unit: "degrees"
+
+# ======================================================================================
+# SIMULATION PHYSICAL SPACE DEFINITION (UNIFIED)
+# ======================================================================================
+# All simulations use the following unified physical space and numerical resolution:
+
+physical_space:
+  maximum_range_km: 100.0      # 100 km maximum range
+  maximum_depth_m: 5000.0      # 5000 m maximum depth  
+  grid_resolution: "256x256"   # Unified numerical grid resolution
+
+# Environment modeling (Munk canonical profile)
+environment:
+  sound_speed_profile:
+    type: "munk"
+    surface_speed: 1548.52  # m/s
+    channel_axis_depth: 1234.5  # m
+    gradient: 0.00737
+    
+  boundaries:
+    surface: "vacuum"           # Free surface
+    bottom: "acoustic_halfspace" # Elastic bottom
+    bottom_properties:
+      sound_speed: 2000.0       # m/s
+      density: 2.0              # g/cm³
+      attenuation: 0.5          # dB/wavelength
+
+# 3. 시스템 경로 설정
+paths:
+  temp_directory: "temp"
+  output_directory: "sctr_data"  # 데이터 및 이미지 저장 위치
+  gepco_file: ""  # JASA 단계: GEBCO 비활성 (평저 강제)
+  bellhop_executable: "C:/Users/whaye/Desktop/deep/atWin10_2020_11_4/windows-bin-20201102/bellhop.exe"
+  kraken_executable: "C:/Users/whaye/Desktop/deep/atWin10_2020_11_4/windows-bin-20201102/kraken.exe"
+  scooter_executable: "C:/Users/whaye/Desktop/deep/atWin10_2020_11_4/windows-bin-20201102/scooter.exe"
+  acoustics_toolbox_bin: "C:/Users/whaye/Desktop/deep/atWin10_2020_11_4/windows-bin-20201102"  # KRAKEN/SCOOTER 실행 파일 위치
+
+# Grid settings (enforced across all scenarios)
+grid:
+  ray_density_map:
+    range_resolution: 256      # 256 points over 100 km
+    depth_resolution: 256      # 256 points over 5000 m  
+    max_range_km: 100.0
+    max_depth_m: 5000.0
+    
+  tl_field:
+    range_resolution: 256      # 256 points over 100 km
+    depth_resolution: 256      # 256 points over 5000 m
+    max_range_km: 100.0
+    max_depth_m: 5000.0
+
+# Quality control and validation
+quality_control:
+  max_ray_count: 50000
+  min_ray_count: 1000
+  tl_dynamic_range_db: 120
+  enable_validation: true
+  
+# Visualization settings (300 DPI PNG)
+visualization:
+  enable_png_output: true
+  dpi: 300
+  format: "png"
+  ray_map_colormap: "hot"
+  tl_field_colormap: "jet_r"
+  tl_range_db: [40, 120]
+
+# Performance settings
+performance:
+  parallel_jobs: 1            # Debug: single job to avoid overload
+  memory_limit_gb: 32         # Keep as-is
+  enable_gpu: true
+  batch_size: 1               # Debug: minimal batch size
+
+debug:
+  preserve_temp_files: true
+# Logging configuration
+logging:
+  level: "INFO"
+  log_file: "production_campaign.log"
+  enable_progress_bar: true
+  enable_timing: true
+
+# ======================================================================================
+# FINAL SUMMARY
+# ======================================================================================
+# Total datasets to generate: 1,009
+# - JASA_Benchmark: 9 datasets (9 frequencies × 1 depth)
+# - Defense_Wideband: 1,000 datasets (100 frequencies × 10 depths)
+#
+# Final deliverables:
+# - 1,009 HDF5 data packages (X, Y, metadata)
+# - 1,009 PNG visualization files (300 DPI)
+# - Complete training dataset for R-DeepONet
+# ======================================================================================
