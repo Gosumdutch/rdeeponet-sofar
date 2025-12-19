@@ -1,12 +1,11 @@
 """
-Trunk HPO pipeline (FF-MLP + SIREN only), physics off, anti-smoothing.
+Trunk HPO pipeline (multiscale FF only), physics off, anti-smoothing.
 
-Stages:
-- stage0: two quick stability checks (MSE/Huber) with AMP forced ON.
-- stage1: global search across family={ff,siren} with TPE+ASHA on subset data.
-- stage2: winner family refinement on longer epochs.
-- stage3: best params, seed=3 replication.
+Stages (names kept as stage1/2):
+- stage1 (scout): DV 6개만, 저해상도/짧은 epoch, 강한 프루닝, 고정 eval 서브셋.
+- stage2 (exploit): stage1 top-k=6 + sigma preset 상위 2개 유지, 3개 추가 DV, 풀 트레이닝.
 
+Objective: overall + 0.5*mid + 0.5*caustic + penalty(mid/caustic >> overall).
 Artifacts: run_dir per trial/seed with config_resolved.yaml, overrides.json,
 metrics.csv, metrics_best.json, best.pt, figures/.
 """
@@ -14,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 import optuna
 from optuna.samplers import TPESampler
@@ -28,28 +27,55 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-def sample_params(trial: optuna.Trial, family: str, stage: str) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
-    params['family'] = family
-    params['lr'] = trial.suggest_loguniform('lr', 2e-4, 5e-3)
-    params['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-6, 5e-3)
-    params['trunk_depth'] = trial.suggest_int('trunk_depth', 4, 10)
-    params['trunk_hidden'] = trial.suggest_int('trunk_hidden', 256, 768, step=64)
-    params['trunk_cond_mode'] = trial.suggest_categorical('trunk_cond_mode', ['film', 'concat'])
-    params['edge_weight_scale'] = trial.suggest_float('edge_weight_scale', 1.0, 5.0)
-    params['grad_threshold'] = trial.suggest_float('grad_threshold', 0.01, 0.06)
+SIGMA_PRESETS = {
+    "two_level": ([0.5, 2.0, 8.0, 32.0], "two_level"),
+    "wide": ([0.25, 1.0, 16.0, 64.0], "wide"),
+    "three_level": ([0.5, 2.0, 8.0, 32.0], "three_level"),
+}
 
-    if family == 'ff':
-        params['trunk_type'] = 'ff'
-        params['trunk_fourier_dim'] = trial.suggest_categorical('trunk_fourier_dim', [128, 256, 512, 768, 1024])
-        params['trunk_fourier_sigma'] = trial.suggest_loguniform('trunk_fourier_sigma', 0.5, 32.0)
-    elif family == 'siren':
-        params['trunk_type'] = 'siren'
-        params['trunk_w0'] = trial.suggest_uniform('trunk_w0', 5.0, 25.0)
-        params['trunk_depth'] = trial.suggest_int('trunk_depth_siren', 4, 6)
-        params['trunk_hidden'] = trial.suggest_int('trunk_hidden_siren', 256, 512, step=64)
+
+def split_dim(total: int, sigmas: list[float], ratio: float = 0.5) -> list[int]:
+    n = len(sigmas)
+    if n == 0:
+        return []
+    if n == 2:
+        low = max(1, int(total * ratio))
+        high = max(1, total - low)
+        return [low, high]
+    dims = [total // n] * n
+    for i in range(total - sum(dims)):
+        dims[i % n] += 1
+    return dims
+
+
+def sample_params(trial: optuna.Trial, stage: str, allowed_sigma_presets: Optional[list[str]] = None) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    # DV set depends on stage
+    params['trunk_type'] = 'ff'
+    params['lr'] = trial.suggest_loguniform('lr', 5e-4, 3e-3)
+    params['trunk_depth'] = trial.suggest_categorical('trunk_depth', [4, 5, 6])
+    params['trunk_hidden'] = 768  # fixed for stage1
+    params['trunk_cond_mode'] = trial.suggest_categorical('trunk_cond_mode', ['film', 'concat'])
+    if params['trunk_cond_mode'] == 'film':
+        params['trunk_film_gain'] = trial.suggest_uniform('trunk_film_gain', 0.5, 3.0)
     else:
-        raise ValueError(f"Unsupported family {family}")
+        params['trunk_film_gain'] = 1.0
+    sigma_choices = allowed_sigma_presets if allowed_sigma_presets else list(SIGMA_PRESETS.keys())
+    sigma_key = trial.suggest_categorical('sigma_bank', sigma_choices)
+    sigma_list, _ = SIGMA_PRESETS[sigma_key]
+    params['trunk_fourier_sigmas'] = sigma_list
+    params['trunk_fourier_dim_total'] = trial.suggest_categorical('trunk_fourier_dim_total', [512, 1024, 1536])
+    params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=0.5)
+    params['weight_decay'] = 1e-6
+    params['edge_weight_scale'] = 8
+    params['grad_threshold'] = 0.005
+
+    if stage == 'stage2':
+        params['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-7, 1e-4)
+        dim_ratio = trial.suggest_categorical('low_high_dim_ratio', ['50_50', '70_30'])
+        ratio = 0.5 if dim_ratio == '50_50' else 0.7
+        params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=ratio)
+        params['edge_weight_scale'] = trial.suggest_categorical('edge_weight_scale', [5, 8])
 
     # loss to keep AMP on
     params['loss_type'] = 'mse'
@@ -120,12 +146,7 @@ def stage1(args, cfg: Dict[str, Any]) -> None:
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage1')
 
     def objective(trial: optuna.Trial):
-        # enforce minimum siren trials to avoid starvation
-        if trial.number < args.siren_min_trials:
-            family = 'siren'
-        else:
-            family = trial.suggest_categorical('family', ['ff', 'siren'])
-        params = sample_params(trial, family, 'stage1')
+        params = sample_params(trial, 'stage1')
         run_dir = stage_root / f"trial_{trial.number:05d}"
         overrides = dict(params)
         overrides.update({
@@ -135,28 +156,71 @@ def stage1(args, cfg: Dict[str, Any]) -> None:
             'pts_per_map': args.pts_per_map,
             'batch_size': args.batch_size,
             'use_amp': True,
+            'eval_subset': args.eval_subset,
         })
         result = fit_one_trial(cfg, overrides=overrides, trial=trial,
-                               force_no_physics=True, force_amp=True)
+                               force_no_physics=True, force_amp=True, enable_gate=True)
         trial.set_user_attr('used_overrides', overrides)
         trial.set_user_attr('trial_dir', str(run_dir))
-        return float(result['best_mae_db'])
+        trial.set_user_attr('val_mae_mid_db', result.get('val_mae_mid_db'))
+        trial.set_user_attr('val_mae_caustic_db', result.get('val_mae_caustic_db'))
+        # objective with penalty
+        overall = float(result['best_mae_db'])
+        mid = float(result.get('val_mae_mid_db', overall))
+        caustic = float(result.get('val_mae_caustic_db', overall))
+        combined = overall + 0.5 * mid + 0.5 * caustic
+        delta = 0.15
+        penalty = 0.3
+        if mid > overall + delta:
+            combined += penalty
+        if caustic > overall + delta:
+            combined += penalty
+        return combined
 
-    study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout_seconds, gc_after_trial=True)
+    study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
+    trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    topk = trials_sorted[:6]
+    sigma_counts = {}
+    for t in trials_sorted:
+        key = t.params.get('sigma_bank')
+        sigma_counts[key] = sigma_counts.get(key, 0) + 1
+    summary = {
+        'best_value': study.best_value,
+        'best_params': study.best_params,
+        'topk': [
+            {'number': t.number, 'value': t.value, 'sigma_bank': t.params.get('sigma_bank'),
+             'params': t.params, 'mid': t.user_attrs.get('val_mae_mid_db'),
+             'caustic': t.user_attrs.get('val_mae_caustic_db')}
+            for t in topk
+        ],
+        'sigma_counts': sigma_counts
+    }
     with open(stage_root / 'stage1_summary.json', 'w') as f:
-        json.dump({'best_value': study.best_value, 'best_params': study.best_params}, f, indent=2)
+        json.dump(summary, f, indent=2)
 
 
 def stage2(args, cfg: Dict[str, Any]) -> None:
     stage1_root = Path(args.output_root) / args.study / 'stage1'
     study1 = get_study(args.study, args.storage)
-    winner_family = pick_winner_family(study1)
+    trials_sorted = [t for t in study1.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    topk_trials = trials_sorted[:6]
+    # top-2 sigma presets
+    sigma_order = []
+    for t in topk_trials:
+        key = t.params.get('sigma_bank')
+        if key not in sigma_order:
+            sigma_order.append(key)
+        if len(sigma_order) >= 2:
+            break
+    allowed_sigma_presets = sigma_order if sigma_order else list(SIGMA_PRESETS.keys())
     study2_name = f"{args.study}_stage2"
     study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage2')
 
     def objective(trial: optuna.Trial):
-        params = sample_params(trial, winner_family, 'stage2')
+        params = sample_params(trial, 'stage2', allowed_sigma_presets=allowed_sigma_presets)
         run_dir = stage_root / f"trial_{trial.number:05d}"
         overrides = dict(params)
         overrides.update({
@@ -168,15 +232,40 @@ def stage2(args, cfg: Dict[str, Any]) -> None:
             'use_amp': True,
         })
         result = fit_one_trial(cfg, overrides=overrides, trial=trial,
-                               force_no_physics=True, force_amp=True)
+                               force_no_physics=True, force_amp=True, enable_gate=False)
         trial.set_user_attr('used_overrides', overrides)
         trial.set_user_attr('trial_dir', str(run_dir))
-        return float(result['best_mae_db'])
+        trial.set_user_attr('val_mae_mid_db', result.get('val_mae_mid_db'))
+        trial.set_user_attr('val_mae_caustic_db', result.get('val_mae_caustic_db'))
+        overall = float(result['best_mae_db'])
+        mid = float(result.get('val_mae_mid_db', overall))
+        caustic = float(result.get('val_mae_caustic_db', overall))
+        combined = overall + 0.5 * mid + 0.5 * caustic
+        delta = 0.15
+        penalty = 0.3
+        if mid > overall + delta:
+            combined += penalty
+        if caustic > overall + delta:
+            combined += penalty
+        return combined
 
-    study2.optimize(objective, n_trials=args.n_trials, timeout=args.timeout_seconds, gc_after_trial=True)
+    study2.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
+    trials_sorted = [t for t in study2.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    topk = trials_sorted[:6]
+    summary = {
+        'best_value': study2.best_value,
+        'best_params': study2.best_params,
+        'topk': [
+            {'number': t.number, 'value': t.value, 'sigma_bank': t.params.get('sigma_bank'),
+             'params': t.params, 'mid': t.user_attrs.get('val_mae_mid_db'),
+             'caustic': t.user_attrs.get('val_mae_caustic_db')}
+            for t in topk
+        ],
+        'allowed_sigma_presets': allowed_sigma_presets
+    }
     with open(stage_root / 'stage2_summary.json', 'w') as f:
-        json.dump({'best_value': study2.best_value, 'best_params': study2.best_params,
-                   'winner_family': winner_family}, f, indent=2)
+        json.dump(summary, f, indent=2)
 
 
 def stage3(args, cfg: Dict[str, Any]) -> None:
@@ -219,7 +308,7 @@ def main():
     ap.add_argument('--pts-per-map', type=int, default=4096)
     ap.add_argument('--batch-size', type=int, default=8)
     ap.add_argument('--timeout-hours', type=float, default=8.0)
-    ap.add_argument('--siren-min-trials', type=int, default=6, help='Force at least this many SIREN trials in stage1')
+    ap.add_argument('--eval-subset', type=int, default=256, help='Fixed eval subset size for stage1')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)

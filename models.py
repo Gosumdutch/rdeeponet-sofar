@@ -384,6 +384,8 @@ class TrunkFFMLP(nn.Module):
                  depth: int = 4,
                  fourier_dim: int = 256,
                  fourier_sigma: float = 1.0,
+                 fourier_sigmas: Optional[Sequence[float]] = None,
+                 fourier_dims: Optional[Sequence[int]] = None,
                  cond_dim: Optional[int] = None,
                  cond_mode: str = 'film',
                  film_gain: float = 1.0):
@@ -392,10 +394,26 @@ class TrunkFFMLP(nn.Module):
         self.film_gain = float(film_gain)
         base_dim = 2 + 4 * L
         self.pe = SinusoidalPE(2, L)
-        self.fourier_dim = int(fourier_dim)
-        self.register_buffer('rff_w', torch.randn(base_dim + (cond_dim or 0), self.fourier_dim) / max(1e-6, float(fourier_sigma)))
-        self.register_buffer('rff_b', torch.rand(self.fourier_dim) * 2 * math.pi)
-        in_dim = self.fourier_dim * 2
+        # Multi-scale RFF banks
+        if fourier_sigmas is None:
+            sigmas = [float(fourier_sigma)]
+        else:
+            sigmas = [float(s) for s in fourier_sigmas]
+        if fourier_dims is None:
+            dims = [int(fourier_dim) // max(1, len(sigmas))] * len(sigmas)
+        else:
+            dims = [int(d) for d in fourier_dims]
+        self.sigma_list = sigmas
+        self.dim_list = dims
+        self.rff_w = nn.ParameterList()
+        self.rff_b = nn.ParameterList()
+        in_dim_base = base_dim + (cond_dim or 0)
+        for idx, (sigma, dim) in enumerate(zip(self.sigma_list, self.dim_list)):
+            w = torch.randn(in_dim_base, dim) / max(1e-6, sigma)
+            b = torch.rand(dim) * 2 * math.pi
+            self.rff_w.append(nn.Parameter(w, requires_grad=False))
+            self.rff_b.append(nn.Parameter(b, requires_grad=False))
+        in_dim = 2 * sum(self.dim_list)
         if self.cond_mode == 'concat' and cond_dim is not None:
             in_dim += cond_dim
         self.hidden_layers = nn.ModuleList()
@@ -440,16 +458,15 @@ class TrunkFFMLP(nn.Module):
         pe = self.pe(coords)
         if cond is not None:
             pe_cond = torch.cat([pe, cond.unsqueeze(1).expand(-1, pe.shape[1], -1)], dim=-1)
-        elif pe.shape[-1] == self.rff_w.shape[0]:
-            pe_cond = pe
         else:
-            # cond missing but rff expects extra dims -> pad zeros
-            pad_dim = self.rff_w.shape[0] - pe.shape[-1]
-            pad = torch.zeros(pe.shape[0], pe.shape[1], pad_dim, device=pe.device, dtype=pe.dtype)
-            pe_cond = torch.cat([pe, pad], dim=-1)
-        proj = pe_cond @ self.rff_w  # [B,N,m]
-        feats = torch.cat([torch.sin(proj + self.rff_b), torch.cos(proj + self.rff_b)], dim=-1)
-        h = feats
+            pe_cond = pe
+
+        feat_list = []
+        for idx, (w, b) in enumerate(zip(self.rff_w, self.rff_b)):
+            proj = pe_cond @ w  # [B,N,dim]
+            feat_list.append(torch.sin(proj + b))
+            feat_list.append(torch.cos(proj + b))
+        h = torch.cat(feat_list, dim=-1)
         if self.cond_mode == 'concat' and cond is not None:
             cond_exp = cond.unsqueeze(1).expand(-1, h.shape[1], -1)
             h = torch.cat([h, cond_exp], dim=-1)
@@ -580,6 +597,8 @@ class RDeepONetV2(nn.Module):
                  trunk_cond_mode: str = 'film',
                  trunk_fourier_dim: int = 256,
                  trunk_fourier_sigma: float = 1.0,
+                 trunk_fourier_sigmas: Optional[Sequence[float]] = None,
+                 trunk_fourier_dims: Optional[Sequence[int]] = None,
                  trunk_w0: float = 30.0):
         super().__init__()
         branch_params = dict(branch_params or {})
@@ -617,6 +636,8 @@ class RDeepONetV2(nn.Module):
                 depth=depth,
                 fourier_dim=trunk_fourier_dim,
                 fourier_sigma=trunk_fourier_sigma,
+                fourier_sigmas=trunk_fourier_sigmas,
+                fourier_dims=trunk_fourier_dims,
                 cond_dim=cond_out,
                 cond_mode=trunk_cond_mode,
                 film_gain=film_gain

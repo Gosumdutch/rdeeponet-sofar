@@ -251,6 +251,8 @@ def build_model(cfg: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None)
     trunk_cond_mode = str(ov.get('trunk_cond_mode', trunk_cfg.get('cond_mode', 'film'))).lower()
     trunk_fourier_dim = int(ov.get('trunk_fourier_dim', trunk_cfg.get('fourier_dim', 256)))
     trunk_fourier_sigma = float(ov.get('trunk_fourier_sigma', trunk_cfg.get('fourier_sigma', 1.0)))
+    trunk_fourier_sigmas = ov.get('trunk_fourier_sigmas', trunk_cfg.get('fourier_sigmas'))
+    trunk_fourier_dims = ov.get('trunk_fourier_dims', trunk_cfg.get('fourier_dims'))
     trunk_w0 = float(ov.get('trunk_w0', trunk_cfg.get('w0', 30.0)))
 
     for key, value in ov.items():
@@ -285,6 +287,8 @@ def build_model(cfg: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None)
         trunk_cond_mode=trunk_cond_mode,
         trunk_fourier_dim=trunk_fourier_dim,
         trunk_fourier_sigma=trunk_fourier_sigma,
+        trunk_fourier_sigmas=trunk_fourier_sigmas,
+        trunk_fourier_dims=trunk_fourier_dims,
         trunk_w0=trunk_w0
     )
 
@@ -345,33 +349,69 @@ def make_scheduler(cfg: Dict[str, Any], optimizer, epochs: int, steps_per_epoch:
     return build_scheduler(optimizer, scfg, epochs)
 
 
-def evaluate_full_mae_db(model: nn.Module,
-                          val_loader_full: DataLoader,
-                          tl_min: float, tl_max: float,
-                          device: torch.device,
-                          check_consistency: bool = False) -> Tuple[float, Optional[float], float]:
+def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_min: float, tl_max: float) -> Tuple[float, float, float]:
+    """
+    Compute overall, mid-range, and caustic MAE (dB).
+    mid-range: r in [0.33, 0.66]; caustic: high-grad mask (top 20%).
+    """
+    tl_pred_norm = tl_pred_norm.squeeze()
+    tl_gt_norm = tl_gt_norm.squeeze()
+    H, W = tl_gt_norm.shape
+    # overall
+    overall = mae_db_from_norm(tl_pred_norm, tl_gt_norm, tl_min, tl_max).item()
+    # mid-range mask
+    r = torch.linspace(0.0, 1.0, W, device=tl_gt_norm.device)
+    mid_mask = (r >= 0.33) & (r <= 0.66)
+    mid_mask = mid_mask.unsqueeze(0).expand(H, -1)
+    mid = mae_db_from_norm(tl_pred_norm[mid_mask], tl_gt_norm[mid_mask], tl_min, tl_max).item()
+    # caustic mask via gradient
+    gx = tl_gt_norm[:, 1:] - tl_gt_norm[:, :-1]
+    gy = tl_gt_norm[1:, :] - tl_gt_norm[:-1, :]
+    grad_mag = torch.sqrt(torch.clamp(gx[:, :-1] ** 2 + gy[:-1, :] ** 2, min=0))
+    if grad_mag.numel() == 0:
+        caustic = overall
+    else:
+        thr = torch.quantile(grad_mag.flatten(), 0.8)
+        mask = torch.zeros_like(tl_gt_norm, dtype=torch.bool)
+        mask[:-1, :-1] |= grad_mag > thr
+        if mask.any():
+            caustic = mae_db_from_norm(tl_pred_norm[mask], tl_gt_norm[mask], tl_min, tl_max).item()
+        else:
+            caustic = overall
+    return float(overall), float(mid), float(caustic)
+
+
+def evaluate_mae_zones(model: nn.Module,
+                       val_loader_full: DataLoader,
+                       tl_min: float, tl_max: float,
+                       device: torch.device,
+                       max_batches: Optional[int] = None,
+                       check_consistency: bool = False) -> Tuple[float, float, float, Optional[float]]:
     model.eval()
-    maes = []
-    maes_percent = []
+    overall_list = []
+    mid_list = []
+    caustic_list = []
     consistency_stats = {'diffs': []} if check_consistency else None
-    db_range = max(1e-6, float(tl_max) - float(tl_min))
     with torch.no_grad():
-        for batch in val_loader_full:
+        for idx, batch in enumerate(val_loader_full):
+            if max_batches is not None and idx >= max_batches:
+                break
             ray = batch['ray'].to(device)
             cond = batch['cond'].to(device)
             tl_gt_norm = batch['tl'].cpu()
             tl_pred_norm = infer_full_map(model, ray, cond, device=device, consistency=consistency_stats)
             tl_pred_norm = tl_pred_norm.unsqueeze(0).unsqueeze(0)
-            mae = mae_db_from_norm(tl_pred_norm, tl_gt_norm, tl_min, tl_max)
-            mae_db = float(mae.item())
-            maes.append(mae_db)
-            maes_percent.append((mae_db / db_range) * 100.0)
-    avg_mae = float(sum(maes) / max(1, len(maes)))
-    avg_pct = float(sum(maes_percent) / max(1, len(maes_percent)))
+            overall, mid, caustic = compute_zone_mae(tl_pred_norm, tl_gt_norm, tl_min, tl_max)
+            overall_list.append(overall)
+            mid_list.append(mid)
+            caustic_list.append(caustic)
+    avg_overall = float(sum(overall_list) / max(1, len(overall_list)))
+    avg_mid = float(sum(mid_list) / max(1, len(mid_list)))
+    avg_caustic = float(sum(caustic_list) / max(1, len(caustic_list)))
     avg_diff = None
     if consistency_stats and consistency_stats['diffs']:
         avg_diff = float(sum(consistency_stats['diffs']) / len(consistency_stats['diffs']))
-    return avg_mae, avg_diff, avg_pct
+    return avg_overall, avg_mid, avg_caustic, avg_diff
 
 
 def fit_one_trial(cfg: Dict[str, Any],
@@ -382,7 +422,8 @@ def fit_one_trial(cfg: Dict[str, Any],
                   grace_epochs: int = 40,
                   patience: int = 30,
                   force_no_physics: bool = False,
-                  force_amp: bool = False) -> Dict[str, Any]:
+                  force_amp: bool = False,
+                  enable_gate: bool = True) -> Dict[str, Any]:
     train_cfg = cfg['training']
     eval_cfg = cfg.get('evaluation', {})
 
@@ -711,16 +752,22 @@ def fit_one_trial(cfg: Dict[str, Any],
         eval_model = ema_model if ema_model is not None else model
         if ema_model is not None:
             eval_model.eval()
-        val_mae, consistency_diff, val_mae_percent = evaluate_full_mae_db(
+        eval_subset = (overrides or {}).get('eval_subset')
+        max_batches = None
+        if eval_subset is not None and len(val_loader_full.dataset) > 0:
+            bs = val_loader_full.batch_size or 1
+            max_batches = max(1, int(eval_subset) // bs)
+        val_overall, val_mid, val_caustic, consistency_diff = evaluate_mae_zones(
             eval_model,
             val_loader_full,
             tl_min,
             tl_max,
             device,
+            max_batches=max_batches,
             check_consistency=bool(eval_cfg.get('check_consistency', False))
         )
-        if not torch.isfinite(torch.tensor(val_mae)).all() or val_mae > 100.0:
-            print(f"Warning: Invalid validation MAE at epoch {epoch}: {val_mae}")
+        if not torch.isfinite(torch.tensor(val_overall)).all() or val_overall > 100.0:
+            print(f"Warning: Invalid validation MAE at epoch {epoch}: {val_overall}")
             if trial is not None:
                 return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf')}
 
@@ -766,8 +813,9 @@ def fit_one_trial(cfg: Dict[str, Any],
             'train_loss': avg_train_loss,
             'train_mae_db': avg_train_mae_db,
             'train_mae_percent': avg_train_mae_percent,
-            'val_mae_db': val_mae,
-            'val_mae_percent': val_mae_percent,
+            'val_mae_db': val_overall,
+            'val_mae_mid_db': val_mid,
+            'val_mae_caustic_db': val_caustic,
             'lr': current_lr,
             'loss': primary_loss_name,
             'consistency_mae': consistency_diff,
@@ -794,17 +842,18 @@ def fit_one_trial(cfg: Dict[str, Any],
             f.write(json.dumps(epoch_log) + '\n')
 
         # Early gate: if loss not decreasing early, cut trial to save time
-        if gate_baseline_loss is None:
-            gate_baseline_loss = avg_train_loss
-        elif epoch < 3 and avg_train_loss >= gate_baseline_loss * 0.99:
-            if trial is not None:
-                trial.report(val_mae, step=epoch)
-            return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf'), 'final_epoch': epoch + 1}
+        if enable_gate:
+            if gate_baseline_loss is None:
+                gate_baseline_loss = avg_train_loss
+            elif epoch < 3 and avg_train_loss >= gate_baseline_loss * 0.99:
+                if trial is not None:
+                    trial.report(val_overall, step=epoch)
+                return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf'), 'final_epoch': epoch + 1}
 
-        improved = val_mae < best_mae
+        improved = val_overall < best_mae
         if improved:
-            best_mae = val_mae
-            best_mae_percent = val_mae_percent
+            best_mae = val_overall
+            best_mae_percent = (val_overall / db_range) * 100.0
             checkpoint = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
@@ -875,7 +924,8 @@ def fit_one_trial(cfg: Dict[str, Any],
     except Exception:
         pass
 
-    return {'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent, 'final_epoch': final_epoch}
+    return {'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent, 'final_epoch': final_epoch,
+            'val_mae_mid_db': val_mid, 'val_mae_caustic_db': val_caustic}
 
 def main():
     parser = argparse.ArgumentParser()
