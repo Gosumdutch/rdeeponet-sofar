@@ -499,9 +499,24 @@ class TrunkSIREN(nn.Module):
                 key = str(idx)
                 self.film_scale[key] = nn.Linear(int(cond_dim), hidden)
                 self.film_shift[key] = nn.Linear(int(cond_dim), hidden)
+        self._apply_siren_init()
 
     def sine(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sin(self.w0 * x)
+
+    def _apply_siren_init(self) -> None:
+        def init_linear(layer: nn.Linear, w0: float, is_first: bool = False):
+            fan_in = layer.in_features
+            if is_first:
+                bound = 1.0 / fan_in
+            else:
+                bound = math.sqrt(6.0 / fan_in) / w0
+            nn.init.uniform_(layer.weight, -bound, bound)
+
+        init_linear(self.first, self.w0, is_first=True)
+        for layer in self.hidden_layers:
+            init_linear(layer, self.w0, is_first=False)
+        init_linear(self.output_layer, self.w0, is_first=False)
 
     def forward(self, coords: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
         if coords.dim() == 2:
@@ -521,6 +536,10 @@ class TrunkSIREN(nn.Module):
                 coords = coords.expand(cond.shape[0], -1, -1)
             else:
                 raise ValueError('Mismatch between coords batch and cond batch sizes.')
+
+        coords = coords.clamp(0.0, 1.0)
+        if cond is not None:
+            cond = cond.clamp(0.0, 1.0)
 
         if self.cond_mode == 'concat' and cond is not None:
             cond_exp = cond.unsqueeze(1).expand(-1, coords.shape[1], -1)

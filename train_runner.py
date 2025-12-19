@@ -537,6 +537,10 @@ def fit_one_trial(cfg: Dict[str, Any],
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     clip_cfg = resolve_gradient_clip(train_cfg)
+    if getattr(model, 'trunk_type', '') == 'siren' and not clip_cfg.enabled:
+        clip_cfg.enabled = True
+        clip_cfg.max_norm = min(clip_cfg.max_norm or 2.0, 2.0)
+        clip_cfg.norm_type = 2.0
     if overrides:
         if 'gradient_clip_val' in overrides:
             clip_cfg.max_norm = float(overrides['gradient_clip_val'])
@@ -557,6 +561,7 @@ def fit_one_trial(cfg: Dict[str, Any],
     metrics_rows: list[Dict[str, Any]] = []
     step_count = 0
     epochs_since_improve = 0
+    gate_baseline_loss = None
 
     # Enhanced logging setup
     training_log_path = outdir / 'training_log.jsonl'
@@ -787,6 +792,14 @@ def fit_one_trial(cfg: Dict[str, Any],
         # Save training log as JSONL
         with open(training_log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(epoch_log) + '\n')
+
+        # Early gate: if loss not decreasing early, cut trial to save time
+        if gate_baseline_loss is None:
+            gate_baseline_loss = avg_train_loss
+        elif epoch < 3 and avg_train_loss >= gate_baseline_loss * 0.99:
+            if trial is not None:
+                trial.report(val_mae, step=epoch)
+            return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf'), 'final_epoch': epoch + 1}
 
         improved = val_mae < best_mae
         if improved:

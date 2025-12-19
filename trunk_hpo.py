@@ -35,7 +35,7 @@ def sample_params(trial: optuna.Trial, family: str, stage: str) -> Dict[str, Any
     params['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-6, 5e-3)
     params['trunk_depth'] = trial.suggest_int('trunk_depth', 4, 10)
     params['trunk_hidden'] = trial.suggest_int('trunk_hidden', 256, 768, step=64)
-    params['trunk_cond_mode'] = trial.suggest_categorical('trunk_cond_mode', ['none', 'film', 'concat'])
+    params['trunk_cond_mode'] = trial.suggest_categorical('trunk_cond_mode', ['film', 'concat'])
     params['edge_weight_scale'] = trial.suggest_float('edge_weight_scale', 1.0, 5.0)
     params['grad_threshold'] = trial.suggest_float('grad_threshold', 0.01, 0.06)
 
@@ -45,7 +45,9 @@ def sample_params(trial: optuna.Trial, family: str, stage: str) -> Dict[str, Any
         params['trunk_fourier_sigma'] = trial.suggest_loguniform('trunk_fourier_sigma', 0.5, 32.0)
     elif family == 'siren':
         params['trunk_type'] = 'siren'
-        params['trunk_w0'] = trial.suggest_uniform('trunk_w0', 10.0, 60.0)
+        params['trunk_w0'] = trial.suggest_uniform('trunk_w0', 5.0, 25.0)
+        params['trunk_depth'] = trial.suggest_int('trunk_depth_siren', 4, 6)
+        params['trunk_hidden'] = trial.suggest_int('trunk_hidden_siren', 256, 512, step=64)
     else:
         raise ValueError(f"Unsupported family {family}")
 
@@ -118,7 +120,11 @@ def stage1(args, cfg: Dict[str, Any]) -> None:
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage1')
 
     def objective(trial: optuna.Trial):
-        family = trial.suggest_categorical('family', ['ff', 'siren'])
+        # enforce minimum siren trials to avoid starvation
+        if trial.number < args.siren_min_trials:
+            family = 'siren'
+        else:
+            family = trial.suggest_categorical('family', ['ff', 'siren'])
         params = sample_params(trial, family, 'stage1')
         run_dir = stage_root / f"trial_{trial.number:05d}"
         overrides = dict(params)
@@ -213,6 +219,7 @@ def main():
     ap.add_argument('--pts-per-map', type=int, default=4096)
     ap.add_argument('--batch-size', type=int, default=8)
     ap.add_argument('--timeout-hours', type=float, default=8.0)
+    ap.add_argument('--siren-min-trials', type=int, default=6, help='Force at least this many SIREN trials in stage1')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)
