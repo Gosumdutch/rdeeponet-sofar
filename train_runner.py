@@ -365,15 +365,21 @@ def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_mi
     mid_mask = mid_mask.unsqueeze(0).expand(H, -1)
     mid = mae_db_from_norm(tl_pred_norm[mid_mask], tl_gt_norm[mid_mask], tl_min, tl_max).item()
     # caustic mask via gradient
-    gx = tl_gt_norm[:, 1:] - tl_gt_norm[:, :-1]
-    gy = tl_gt_norm[1:, :] - tl_gt_norm[:-1, :]
-    grad_mag = torch.sqrt(torch.clamp(gx[:, :-1] ** 2 + gy[:-1, :] ** 2, min=0))
+    try:
+        gy, gx = torch.gradient(tl_gt_norm)
+    except Exception:
+        gx = torch.zeros_like(tl_gt_norm)
+        gy = torch.zeros_like(tl_gt_norm)
+        gx[:, :-1] = tl_gt_norm[:, 1:] - tl_gt_norm[:, :-1]
+        gx[:, -1] = gx[:, -2]
+        gy[:-1, :] = tl_gt_norm[1:, :] - tl_gt_norm[:-1, :]
+        gy[-1, :] = gy[-2, :]
+    grad_mag = torch.sqrt(torch.clamp(gx ** 2 + gy ** 2, min=0))
     if grad_mag.numel() == 0:
         caustic = overall
     else:
         thr = torch.quantile(grad_mag.flatten(), 0.8)
-        mask = torch.zeros_like(tl_gt_norm, dtype=torch.bool)
-        mask[:-1, :-1] |= grad_mag > thr
+        mask = grad_mag > thr
         if mask.any():
             caustic = mae_db_from_norm(tl_pred_norm[mask], tl_gt_norm[mask], tl_min, tl_max).item()
         else:
