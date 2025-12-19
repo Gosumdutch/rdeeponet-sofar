@@ -64,8 +64,8 @@ def sample_params(trial: optuna.Trial, stage: str, allowed_sigma_presets: Option
     sigma_key = trial.suggest_categorical('sigma_bank', sigma_choices)
     sigma_list, _ = SIGMA_PRESETS[sigma_key]
     params['trunk_fourier_sigmas'] = sigma_list
-        params['trunk_fourier_dim_total'] = trial.suggest_categorical('trunk_fourier_dim_total', [1024, 1536])
-        params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=0.5)
+    params['trunk_fourier_dim_total'] = trial.suggest_categorical('trunk_fourier_dim_total', [1024, 1536])
+    params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=0.5)
     params['weight_decay'] = 1e-6
     params['edge_weight_scale'] = 8
     params['grad_threshold'] = 0.005
