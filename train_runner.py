@@ -176,7 +176,7 @@ def make_datasets(cfg: Dict[str, Any], split_ratio: Dict[str, float], overrides:
     val_ds_full = RDeepONetH5(root, 'val', split_ratio, 'full', pts, norm_cfg, sampler_cfg)
 
     limit = None
-    if overrides and "limit_files" in overrides:
+    if overrides and "limit_files" in overrides and overrides["limit_files"] is not None:
         limit = int(overrides["limit_files"])
     else:
         limit = data_cfg.get('limit_files')
