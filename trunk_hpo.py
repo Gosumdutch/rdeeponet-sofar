@@ -64,14 +64,14 @@ def sample_params(trial: optuna.Trial, stage: str, allowed_sigma_presets: Option
     sigma_key = trial.suggest_categorical('sigma_bank', sigma_choices)
     sigma_list, _ = SIGMA_PRESETS[sigma_key]
     params['trunk_fourier_sigmas'] = sigma_list
-    params['trunk_fourier_dim_total'] = trial.suggest_categorical('trunk_fourier_dim_total', [512, 1024, 1536])
-    params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=0.5)
+        params['trunk_fourier_dim_total'] = trial.suggest_categorical('trunk_fourier_dim_total', [1024, 1536])
+        params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=0.5)
     params['weight_decay'] = 1e-6
     params['edge_weight_scale'] = 8
     params['grad_threshold'] = 0.005
 
     if stage == 'stage2':
-        params['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-7, 1e-4)
+        params['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-6, 5e-3)
         dim_ratio = trial.suggest_categorical('low_high_dim_ratio', ['50_50', '70_30'])
         ratio = 0.5 if dim_ratio == '50_50' else 0.7
         params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], sigma_list, ratio=ratio)
@@ -218,9 +218,56 @@ def stage2(args, cfg: Dict[str, Any]) -> None:
     study2_name = f"{args.study}_stage2"
     study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage2')
+    # Forced coverage queue: 12 combos (sigma × grad × ratio)
+    forced_queue = []
+    for sigma_key in allowed_sigma_presets:
+        for grad_th in [0.005, 0.01, 0.02]:
+            for ratio_key, ratio_val in [('50_50', 0.5), ('70_30', 0.7)]:
+                forced_queue.append({'sigma_bank': sigma_key,
+                                     'grad_threshold': grad_th,
+                                     'low_high_dim_ratio': ratio_key})
+                if len(forced_queue) >= 12:
+                    break
+            if len(forced_queue) >= 12:
+                break
+        if len(forced_queue) >= 12:
+            break
+
+    # Track Fourier dim coverage targets
+    target_per_dim = {1024: 8, 1536: 8}
+    dim_counts = {1024: 0, 1536: 0}
 
     def objective(trial: optuna.Trial):
         params = sample_params(trial, 'stage2', allowed_sigma_presets=allowed_sigma_presets)
+        # Apply forced combos for first 12 trials
+        if trial.number < len(forced_queue):
+            forced = forced_queue[trial.number]
+            params['sigma_bank'] = forced['sigma_bank']
+            params['trunk_fourier_sigmas'] = SIGMA_PRESETS[params['sigma_bank']][0]
+            params['grad_threshold'] = forced['grad_threshold']
+            params['low_high_dim_ratio'] = forced['low_high_dim_ratio']
+            ratio = 0.5 if forced['low_high_dim_ratio'] == '50_50' else 0.7
+            params['trunk_fourier_dims'] = split_dim(params['trunk_fourier_dim_total'], params['trunk_fourier_sigmas'], ratio=ratio)
+
+        # Enforce Fourier dim coverage
+        if dim_counts[1024] < target_per_dim[1024] and dim_counts[1536] < target_per_dim[1536]:
+            # choose the lesser-covered one
+            target_dim = min(dim_counts, key=lambda k: dim_counts[k]/target_per_dim[k])
+        else:
+            target_dim = min(dim_counts, key=dim_counts.get)
+        if dim_counts[target_dim] < target_per_dim[target_dim]:
+            params['trunk_fourier_dim_total'] = target_dim
+        dim_counts[params['trunk_fourier_dim_total']] += 1
+
+        # Hard constraints for stage2
+        params['trunk_cond_mode'] = 'concat'
+        params['trunk_depth'] = trial.suggest_categorical('trunk_depth_stage2', [5, 6, 7])
+        # First 4 trials: restrict lr to lower band
+        if trial.number < 4:
+            params['lr'] = trial.suggest_loguniform('lr_lower_band', 6e-4, 1.2e-3)
+        else:
+            params['lr'] = trial.suggest_loguniform('lr', 5e-4, 2.5e-3)
+
         run_dir = stage_root / f"trial_{trial.number:05d}"
         overrides = dict(params)
         overrides.update({
@@ -240,14 +287,7 @@ def stage2(args, cfg: Dict[str, Any]) -> None:
         overall = float(result['best_mae_db'])
         mid = float(result.get('val_mae_mid_db', overall))
         caustic = float(result.get('val_mae_caustic_db', overall))
-        combined = overall + 0.5 * mid + 0.5 * caustic
-        delta = 0.15
-        penalty = 0.3
-        if mid > overall + delta:
-            combined += penalty
-        if caustic > overall + delta:
-            combined += penalty
-        return combined
+        return overall + 0.5 * mid + 0.5 * caustic
 
     study2.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
     trials_sorted = [t for t in study2.trials if t.state == optuna.trial.TrialState.COMPLETE]
