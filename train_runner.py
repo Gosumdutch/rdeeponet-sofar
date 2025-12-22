@@ -349,10 +349,10 @@ def make_scheduler(cfg: Dict[str, Any], optimizer, epochs: int, steps_per_epoch:
     return build_scheduler(optimizer, scfg, epochs)
 
 
-def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_min: float, tl_max: float) -> Tuple[float, float, float]:
+def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_min: float, tl_max: float) -> Tuple[float, float, float, float]:
     """
-    Compute overall, mid-range, and caustic MAE (dB).
-    mid-range: r in [0.33, 0.66]; caustic: high-grad mask (top 20%).
+    Compute overall, mid-range, caustic, and highfreq MAE (dB).
+    mid-range: r in [0.33, 0.66]; caustic: high-grad mask (top 20%); highfreq: top 10% grad.
     """
     tl_pred_norm = tl_pred_norm.squeeze()
     tl_gt_norm = tl_gt_norm.squeeze()
@@ -375,16 +375,20 @@ def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_mi
         gy[:-1, :] = tl_gt_norm[1:, :] - tl_gt_norm[:-1, :]
         gy[-1, :] = gy[-2, :]
     grad_mag = torch.sqrt(torch.clamp(gx ** 2 + gy ** 2, min=0))
-    if grad_mag.numel() == 0:
-        caustic = overall
-    else:
-        thr = torch.quantile(grad_mag.flatten(), 0.8)
-        mask = grad_mag > thr
-        if mask.any():
-            caustic = mae_db_from_norm(tl_pred_norm[mask], tl_gt_norm[mask], tl_min, tl_max).item()
-        else:
-            caustic = overall
-    return float(overall), float(mid), float(caustic)
+    caustic = overall
+    highfreq = overall
+    if grad_mag.numel() > 0:
+        # caustic: top 20% gradient
+        thr_caustic = torch.quantile(grad_mag.flatten(), 0.8)
+        mask_caustic = grad_mag > thr_caustic
+        if mask_caustic.any():
+            caustic = mae_db_from_norm(tl_pred_norm[mask_caustic], tl_gt_norm[mask_caustic], tl_min, tl_max).item()
+        # highfreq: top 10% gradient (stricter)
+        thr_highfreq = torch.quantile(grad_mag.flatten(), 0.9)
+        mask_highfreq = grad_mag > thr_highfreq
+        if mask_highfreq.any():
+            highfreq = mae_db_from_norm(tl_pred_norm[mask_highfreq], tl_gt_norm[mask_highfreq], tl_min, tl_max).item()
+    return float(overall), float(mid), float(caustic), float(highfreq)
 
 
 def evaluate_mae_zones(model: nn.Module,
@@ -392,11 +396,12 @@ def evaluate_mae_zones(model: nn.Module,
                        tl_min: float, tl_max: float,
                        device: torch.device,
                        max_batches: Optional[int] = None,
-                       check_consistency: bool = False) -> Tuple[float, float, float, Optional[float]]:
+                       check_consistency: bool = False) -> Tuple[float, float, float, float, Optional[float]]:
     model.eval()
     overall_list = []
     mid_list = []
     caustic_list = []
+    highfreq_list = []
     consistency_stats = {'diffs': []} if check_consistency else None
     with torch.no_grad():
         for idx, batch in enumerate(val_loader_full):
@@ -407,17 +412,19 @@ def evaluate_mae_zones(model: nn.Module,
             tl_gt_norm = batch['tl'].cpu()
             tl_pred_norm = infer_full_map(model, ray, cond, device=device, consistency=consistency_stats)
             tl_pred_norm = tl_pred_norm.unsqueeze(0).unsqueeze(0)
-            overall, mid, caustic = compute_zone_mae(tl_pred_norm, tl_gt_norm, tl_min, tl_max)
+            overall, mid, caustic, highfreq = compute_zone_mae(tl_pred_norm, tl_gt_norm, tl_min, tl_max)
             overall_list.append(overall)
             mid_list.append(mid)
             caustic_list.append(caustic)
+            highfreq_list.append(highfreq)
     avg_overall = float(sum(overall_list) / max(1, len(overall_list)))
     avg_mid = float(sum(mid_list) / max(1, len(mid_list)))
     avg_caustic = float(sum(caustic_list) / max(1, len(caustic_list)))
+    avg_highfreq = float(sum(highfreq_list) / max(1, len(highfreq_list)))
     avg_diff = None
     if consistency_stats and consistency_stats['diffs']:
         avg_diff = float(sum(consistency_stats['diffs']) / len(consistency_stats['diffs']))
-    return avg_overall, avg_mid, avg_caustic, avg_diff
+    return avg_overall, avg_mid, avg_caustic, avg_highfreq, avg_diff
 
 
 def fit_one_trial(cfg: Dict[str, Any],
@@ -763,7 +770,7 @@ def fit_one_trial(cfg: Dict[str, Any],
         if eval_subset is not None and len(val_loader_full.dataset) > 0:
             bs = val_loader_full.batch_size or 1
             max_batches = max(1, int(eval_subset) // bs)
-        val_overall, val_mid, val_caustic, consistency_diff = evaluate_mae_zones(
+        val_overall, val_mid, val_caustic, val_highfreq, consistency_diff = evaluate_mae_zones(
             eval_model,
             val_loader_full,
             tl_min,
@@ -822,6 +829,7 @@ def fit_one_trial(cfg: Dict[str, Any],
             'val_mae_db': val_overall,
             'val_mae_mid_db': val_mid,
             'val_mae_caustic_db': val_caustic,
+            'val_mae_highfreq_db': val_highfreq,
             'lr': current_lr,
             'loss': primary_loss_name,
             'consistency_mae': consistency_diff,
@@ -931,7 +939,7 @@ def fit_one_trial(cfg: Dict[str, Any],
         pass
 
     return {'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent, 'final_epoch': final_epoch,
-            'val_mae_mid_db': val_mid, 'val_mae_caustic_db': val_caustic}
+            'val_mae_mid_db': val_mid, 'val_mae_caustic_db': val_caustic, 'val_mae_highfreq_db': val_highfreq}
 
 def main():
     parser = argparse.ArgumentParser()

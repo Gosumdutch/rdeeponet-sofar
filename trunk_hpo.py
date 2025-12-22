@@ -53,7 +53,10 @@ def sample_params(trial: optuna.Trial, stage: str, allowed_sigma_presets: Option
     # DV set depends on stage
     params['trunk_type'] = 'ff'
     params['lr'] = trial.suggest_loguniform('lr', 5e-4, 3e-3)
-    params['trunk_depth'] = trial.suggest_categorical('trunk_depth', [4, 5, 6])
+    if stage == 'stage1':
+        params['trunk_depth'] = trial.suggest_categorical('trunk_depth', [4, 5, 6])
+    else:
+        params['trunk_depth'] = 6
     params['trunk_hidden'] = 768  # fixed for stage1
     params['trunk_cond_mode'] = trial.suggest_categorical('trunk_cond_mode', ['film', 'concat'])
     if params['trunk_cond_mode'] == 'film':
@@ -309,11 +312,12 @@ def stage2(args, cfg: Dict[str, Any]) -> None:
 
 
 def stage3(args, cfg: Dict[str, Any]) -> None:
+    """Stage3: Reproducibility test with 3 seeds."""
     study2_name = f"{args.study}_stage2"
     study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
     best_params = dict(study2.best_params)
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage3')
-    seeds = [42, 43, 44]
+    seeds = [0, 1, 2]  # Changed from [42, 43, 44]
     results = []
     for s in seeds:
         run_dir = stage_root / f"seed_{s}"
@@ -329,9 +333,240 @@ def stage3(args, cfg: Dict[str, Any]) -> None:
         })
         result = fit_one_trial(cfg, overrides=overrides, trial=None,
                                force_no_physics=True, force_amp=True)
-        results.append({'seed': s, 'result': result})
+        results.append({
+            'seed': s,
+            'mae_fullgrid': result.get('best_mae_db'),
+            'mae_mid': result.get('val_mae_mid_db'),
+            'mae_caustic': result.get('val_mae_caustic_db'),
+            'mae_highfreq': result.get('val_mae_highfreq_db'),
+            'result': result
+        })
+    # Summary statistics
+    mae_values = [r['mae_fullgrid'] for r in results if r['mae_fullgrid'] is not None]
+    summary = {
+        'results': results,
+        'params': best_params,
+        'stats': {
+            'mean_mae': float(sum(mae_values) / len(mae_values)) if mae_values else None,
+            'std_mae': float((sum((x - sum(mae_values)/len(mae_values))**2 for x in mae_values) / len(mae_values))**0.5) if len(mae_values) > 1 else 0.0,
+            'min_mae': min(mae_values) if mae_values else None,
+            'max_mae': max(mae_values) if mae_values else None,
+        }
+    }
     with open(stage_root / 'stage3_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def stage3_prime(args, cfg: Dict[str, Any]) -> None:
+    """Stage3-Prime: Weight decay re-exploration with grid search."""
+    study2_name = f"{args.study}_stage2"
+    study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
+    best_params = dict(study2.best_params)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage3_prime')
+    
+    # Fixed params from Stage2 best, only vary weight_decay
+    wd_grid = [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 4e-3]
+    results = []
+    
+    for wd in wd_grid:
+        run_dir = stage_root / f"wd_{wd:.0e}" if wd > 0 else stage_root / "wd_0"
+        overrides = dict(best_params)
+        overrides['weight_decay'] = wd
+        overrides.update({
+            'outdir': str(run_dir),
+            'epochs': args.epochs,
+            'limit_files': args.limit_files,
+            'pts_per_map': args.pts_per_map,
+            'batch_size': args.batch_size,
+            'use_amp': True,
+            'seed': 0,  # Fixed seed for fair comparison
+        })
+        result = fit_one_trial(cfg, overrides=overrides, trial=None,
+                               force_no_physics=True, force_amp=True)
+        results.append({
+            'weight_decay': wd,
+            'mae_fullgrid': result.get('best_mae_db'),
+            'mae_mid': result.get('val_mae_mid_db'),
+            'mae_caustic': result.get('val_mae_caustic_db'),
+            'mae_highfreq': result.get('val_mae_highfreq_db'),
+            'result': result
+        })
+    
+    # Find best wd
+    best_result = min(results, key=lambda x: x['mae_fullgrid'] if x['mae_fullgrid'] else float('inf'))
+    summary = {
+        'results': results,
+        'base_params': best_params,
+        'best_wd': best_result['weight_decay'],
+        'best_mae': best_result['mae_fullgrid'],
+        'wd_grid': wd_grid
+    }
+    with open(stage_root / 'stage3_prime_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def load_best_params_for_eval(args) -> Dict[str, Any]:
+    stage3_path = Path(args.output_root) / args.study / 'stage3' / 'stage3_summary.json'
+    stage2_path = Path(args.output_root) / args.study / 'stage2' / 'stage2_summary.json'
+    if stage3_path.exists():
+        with open(stage3_path, 'r') as f:
+            data = json.load(f)
+            return dict(data.get('params', {}))
+    if stage2_path.exists():
+        with open(stage2_path, 'r') as f:
+            data = json.load(f)
+            return dict(data.get('best_params', {}))
+    raise FileNotFoundError("No stage3 or stage2 summary found for best params.")
+
+
+def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
+    best_params = load_best_params_for_eval(args)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage4_ood')
+    splits = args.split_ids or ['OOD_range_70_30']
+    # Always include IID baseline
+    eval_targets = ['IID'] + splits
+    results = []
+    for split in eval_targets:
+        run_dir = stage_root / split
+        overrides = dict(best_params)
+        overrides.update({
+            'outdir': str(run_dir),
+            'epochs': 1,
+            'limit_files': args.limit_files,
+            'pts_per_map': args.pts_per_map,
+            'batch_size': args.batch_size,
+            'use_amp': True,
+            'eval_subset': args.eval_subset,
+        })
+        # Note: split-specific dataset handling is not implemented; split label for reporting only.
+        res = fit_one_trial(cfg, overrides=overrides, trial=None,
+                            force_no_physics=True, force_amp=True, enable_gate=False)
+        results.append({'split': split, 'result': res})
+    with open(stage_root / 'stage4_summary.json', 'w') as f:
         json.dump({'results': results, 'params': best_params}, f, indent=2)
+
+
+def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
+    best_params = load_best_params_for_eval(args)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage5_epoch')
+    study_name = f"{args.study}_stage5_epoch"
+    # No ASHA (pruner=None) because epoch is budget variable
+    sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=10)
+    study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', '_stage5.db'),
+                                load_if_exists=True, sampler=sampler, direction='minimize')
+
+    def objective(trial: optuna.Trial):
+        overrides = dict(best_params)
+        overrides.update({
+            'epochs': trial.suggest_categorical('epochs_tune', [60, 90, 120, 180]),
+            'outdir': str(stage_root / f"trial_{trial.number:05d}"),
+            'limit_files': args.limit_files,
+            'pts_per_map': args.pts_per_map,
+            'batch_size': args.batch_size,
+            'use_amp': True,
+        })
+        # lr/wd + physics DVs
+        overrides['lr'] = trial.suggest_loguniform('lr', 6e-4, 2.0e-3)
+        overrides['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-7, 5e-3)
+        overrides['loss_type'] = 'huber'
+        overrides['huber_delta'] = trial.suggest_categorical('huber_delta', [0.5, 1.0, 1.5])
+        lambda_rec = trial.suggest_loguniform('lambda_rec', 1e-4, 1e-2)
+        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
+        overrides['loss_reciprocity_weight'] = lambda_rec
+        overrides['loss_smooth_weight'] = 0.0
+        overrides['loss_tv_weight'] = 0.0
+        if reg_type == 'grad':
+            overrides['loss_smooth_weight'] = trial.suggest_loguniform('lambda_grad', 1e-6, 3e-4)
+        elif reg_type == 'tv':
+            overrides['loss_tv_weight'] = trial.suggest_loguniform('lambda_tv', 1e-6, 1e-4)
+        overrides['physics_warmup_epochs'] = trial.suggest_categorical('physics_warmup_epochs', [20, 30, 40])
+        res = fit_one_trial(cfg, overrides=overrides, trial=trial,
+                            force_no_physics=False, force_amp=True, enable_gate=False)
+        return float(res['best_mae_db'])
+
+    study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
+    trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    with open(stage_root / 'stage5_summary.json', 'w') as f:
+        json.dump({
+            'best_value': study.best_value,
+            'best_params': study.best_params,
+            'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
+        }, f, indent=2)
+
+
+def stage6_physics(args, cfg: Dict[str, Any]) -> None:
+    best_params = load_best_params_for_eval(args)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage6_physics')
+    study_name = f"{args.study}_stage6_physics"
+    study = get_study(study_name, args.storage.replace('.db', '_stage6.db'))
+
+    def objective(trial: optuna.Trial):
+        overrides = dict(best_params)
+        overrides.update({
+            'outdir': str(stage_root / f"trial_{trial.number:05d}"),
+            'epochs': args.epochs,
+            'limit_files': args.limit_files,
+            'pts_per_map': args.pts_per_map,
+            'batch_size': args.batch_size,
+            'use_amp': True,
+            'loss_type': 'huber',
+            'huber_delta': trial.suggest_uniform('huber_delta', 0.5, 1.5),
+        })
+        lambda_rec = trial.suggest_loguniform('lambda_rec', 1e-5, 5e-2)
+        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
+        overrides['loss_reciprocity_weight'] = lambda_rec
+        overrides['loss_smooth_weight'] = 0.0
+        overrides['loss_tv_weight'] = 0.0
+        if reg_type == 'grad':
+            overrides['loss_smooth_weight'] = trial.suggest_loguniform('lambda_grad', 1e-6, 1e-3)
+        elif reg_type == 'tv':
+            overrides['loss_tv_weight'] = trial.suggest_loguniform('lambda_tv', 1e-6, 1e-3)
+        res = fit_one_trial(cfg, overrides=overrides, trial=trial,
+                            force_no_physics=False, force_amp=True, enable_gate=False)
+        return float(res['best_mae_db'])
+
+    study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
+    trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    with open(stage_root / 'stage6_summary.json', 'w') as f:
+        json.dump({
+            'best_value': study.best_value,
+            'best_params': study.best_params,
+            'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
+        }, f, indent=2)
+
+
+def stage7_branch(args, cfg: Dict[str, Any]) -> None:
+    best_params = load_best_params_for_eval(args)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage7_branch')
+    study_name = f"{args.study}_stage7_branch"
+    study = get_study(study_name, args.storage.replace('.db', '_stage7.db'))
+
+    def objective(trial: optuna.Trial):
+        overrides = dict(best_params)
+        overrides.update({
+            'outdir': str(stage_root / f"trial_{trial.number:05d}"),
+            'epochs': args.epochs,
+            'limit_files': args.limit_files,
+            'pts_per_map': args.pts_per_map,
+            'batch_size': args.batch_size,
+            'use_amp': True,
+        })
+        overrides['branch_variant'] = trial.suggest_categorical('branch_variant', ['resnet18', 'se_resnet18'])
+        res = fit_one_trial(cfg, overrides=overrides, trial=trial,
+                            force_no_physics=True, force_amp=True, enable_gate=False)
+        return float(res['best_mae_db'])
+
+    study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
+    trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    with open(stage_root / 'stage7_summary.json', 'w') as f:
+        json.dump({
+            'best_value': study.best_value,
+            'best_params': study.best_params,
+            'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
+        }, f, indent=2)
 
 
 def main():
@@ -341,7 +576,7 @@ def main():
     ap.add_argument('--storage', type=str, default='sqlite:///experiments/optuna/trunk_global.db')
     ap.add_argument('--output-root', type=str, default='experiments/trunk_hpo')
     ap.add_argument('--stage', type=str, required=True,
-                    choices=['stage0', 'stage1', 'stage2', 'stage3'])
+                    choices=['stage0', 'stage1', 'stage2', 'stage3', 'stage3_prime', 'stage4', 'stage5', 'stage6', 'stage7'])
     ap.add_argument('--n-trials', type=int, default=36)
     ap.add_argument('--epochs', type=int, default=12)
     ap.add_argument('--limit-files', type=int, default=200)
@@ -349,6 +584,7 @@ def main():
     ap.add_argument('--batch-size', type=int, default=8)
     ap.add_argument('--timeout-hours', type=float, default=8.0)
     ap.add_argument('--eval-subset', type=int, default=256, help='Fixed eval subset size for stage1')
+    ap.add_argument('--split-ids', nargs='*', default=None, help='OOD split ids for stage4')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)
@@ -377,6 +613,32 @@ def main():
         args.pts_per_map = 8192
         args.batch_size = 8
         stage3(args, cfg)
+    elif args.stage == 'stage3_prime':
+        if args.epochs == 12:
+            args.epochs = 60
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage3_prime(args, cfg)
+    elif args.stage == 'stage4':
+        if args.epochs == 12:
+            args.epochs = 60
+        stage4_eval_ood(args, cfg)
+    elif args.stage == 'stage5':
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage5_epoch_tune(args, cfg)
+    elif args.stage == 'stage6':
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage6_physics(args, cfg)
+    elif args.stage == 'stage7':
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage7_branch(args, cfg)
 
 
 if __name__ == '__main__':
