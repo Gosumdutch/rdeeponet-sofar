@@ -574,8 +574,9 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     tl_min = norm_cfg.get('tl', {}).get('tl_min', 40.0)
     tl_max = norm_cfg.get('tl', {}).get('tl_max', 120.0)
     
+    data_root = cfg['data'].get('root', cfg['data'].get('path', 'R-DeepONet_Data/data/h5'))
     val_ds = RDeepONetH5(
-        root=cfg['data']['root'],
+        root=data_root,
         split='val',
         split_ratio=cfg['data'].get('split_ratio', {'train': 0.8, 'val': 0.1, 'test': 0.1}),
         mode='full',
