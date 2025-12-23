@@ -451,6 +451,13 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     else:
         model_cfg = cfg.get('model', {})
     
+    # Filter only valid RDeepONetV2 kwargs
+    valid_keys = {'K', 'pretrained', 'dropout', 'L', 'hidden', 'depth', 'cond_hidden', 'cond_out',
+                  'branch_variant', 'branch_params', 'branch_out_dim', 'film_layers', 'film_gain',
+                  'trunk_type', 'trunk_cond_mode', 'trunk_fourier_dim', 'trunk_fourier_sigma',
+                  'trunk_fourier_sigmas', 'trunk_fourier_dims', 'trunk_w0'}
+    model_cfg = {k: v for k, v in model_cfg.items() if k in valid_keys}
+    
     # Build model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = RDeepONetV2(**model_cfg).to(device)
