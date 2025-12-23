@@ -420,30 +420,138 @@ def load_best_params_for_eval(args) -> Dict[str, Any]:
 
 
 def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
-    best_params = load_best_params_for_eval(args)
+    """Stage4: OOD evaluation without training. Load best model and evaluate on different range zones."""
+    import torch
+    from dataset import RDeepONetH5
+    from torch.utils.data import DataLoader
+    from train_runner import evaluate_mae_zones, mae_db_from_norm
+    from models import RDeepONetV2
+    
+    # Find best model from stage3_prime (wd=1e-4) or stage3
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage4_ood')
-    splits = args.split_ids or ['OOD_range_70_30']
-    # Always include IID baseline
-    eval_targets = ['IID'] + splits
-    results = []
-    for split in eval_targets:
-        run_dir = stage_root / split
-        overrides = dict(best_params)
-        overrides.update({
-            'outdir': str(run_dir),
-            'epochs': 1,
-            'limit_files': args.limit_files,
-            'pts_per_map': args.pts_per_map,
-            'batch_size': args.batch_size,
-            'use_amp': True,
-            'eval_subset': args.eval_subset,
-        })
-        # Note: split-specific dataset handling is not implemented; split label for reporting only.
-        res = fit_one_trial(cfg, overrides=overrides, trial=None,
-                            force_no_physics=True, force_amp=True, enable_gate=False)
-        results.append({'split': split, 'result': res})
+    best_model_candidates = [
+        Path(args.output_root) / args.study / 'stage3_prime' / 'wd_1e-04' / 'best.pt',
+        Path(args.output_root) / args.study / 'stage3' / 'seed_1' / 'best.pt',
+        Path(args.output_root) / args.study / 'stage2' / 'trial_00000' / 'best.pt',
+    ]
+    best_model_path = None
+    for p in best_model_candidates:
+        if p.exists():
+            best_model_path = p
+            break
+    if best_model_path is None:
+        raise FileNotFoundError(f"No best model found. Checked: {best_model_candidates}")
+    
+    print(f"Loading model from: {best_model_path}")
+    checkpoint = torch.load(best_model_path, map_location='cpu')
+    model_cfg = checkpoint.get('config', cfg.get('model', {}))
+    
+    # Build model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = RDeepONetV2(**model_cfg).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    # Load validation dataset
+    norm_cfg = cfg.get('norm', {})
+    tl_min = norm_cfg.get('tl', {}).get('tl_min', 40.0)
+    tl_max = norm_cfg.get('tl', {}).get('tl_max', 120.0)
+    
+    val_ds = RDeepONetH5(
+        root=cfg['data']['root'],
+        split='val',
+        split_ratio=cfg['data'].get('split_ratio', {'train': 0.8, 'val': 0.1, 'test': 0.1}),
+        mode='full',
+        pts_per_map=args.pts_per_map,
+        norm_cfg=norm_cfg
+    )
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0)
+    
+    # Evaluate on different range zones
+    results = {'IID': [], 'OOD_range_70_30': [], 'OOD_range_far': []}
+    
+    with torch.no_grad():
+        for idx, batch in enumerate(val_loader):
+            if args.limit_files and idx >= args.limit_files:
+                break
+            ray = batch['ray'].to(device)
+            cond = batch['cond'].to(device)
+            tl_gt_norm = batch['tl'].cpu().squeeze()
+            
+            # Full map inference
+            from train_runner import infer_full_map
+            tl_pred_norm = infer_full_map(model, ray, cond, device=device)
+            
+            H, W = tl_gt_norm.shape
+            r_coords = torch.linspace(0, 1, W)
+            
+            # IID (full range 0-70%)
+            iid_mask = r_coords <= 0.7
+            # OOD_range_70_30 (70-100%)
+            ood_mask = r_coords > 0.7
+            # OOD_far (last 20%)
+            far_mask = r_coords > 0.8
+            
+            # Compute MAE for each zone
+            def zone_mae(pred, gt, mask, tl_min, tl_max):
+                mask_2d = mask.unsqueeze(0).expand(H, -1)
+                if not mask_2d.any():
+                    return None
+                pred_zone = pred[mask_2d]
+                gt_zone = gt[mask_2d]
+                return mae_db_from_norm(pred_zone, gt_zone, tl_min, tl_max).item()
+            
+            iid_mae = zone_mae(tl_pred_norm, tl_gt_norm, iid_mask, tl_min, tl_max)
+            ood_mae = zone_mae(tl_pred_norm, tl_gt_norm, ood_mask, tl_min, tl_max)
+            far_mae = zone_mae(tl_pred_norm, tl_gt_norm, far_mask, tl_min, tl_max)
+            
+            # Mid/caustic/highfreq for each zone
+            from train_runner import compute_zone_mae
+            overall, mid, caustic, highfreq = compute_zone_mae(
+                tl_pred_norm.unsqueeze(0).unsqueeze(0),
+                tl_gt_norm.unsqueeze(0).unsqueeze(0),
+                tl_min, tl_max
+            )
+            
+            results['IID'].append({'mae': iid_mae, 'overall': overall, 'mid': mid, 'caustic': caustic, 'highfreq': highfreq})
+            results['OOD_range_70_30'].append({'mae': ood_mae})
+            results['OOD_range_far'].append({'mae': far_mae})
+    
+    # Aggregate
+    def avg(lst, key='mae'):
+        vals = [x[key] for x in lst if x.get(key) is not None]
+        return float(sum(vals) / len(vals)) if vals else None
+    
+    iid_fullgrid = avg(results['IID'], 'overall')
+    iid_mid = avg(results['IID'], 'mid')
+    iid_caustic = avg(results['IID'], 'caustic')
+    iid_highfreq = avg(results['IID'], 'highfreq')
+    ood_70_30 = avg(results['OOD_range_70_30'])
+    ood_far = avg(results['OOD_range_far'])
+    
+    delta_tl = (ood_70_30 - iid_fullgrid) if (ood_70_30 and iid_fullgrid) else None
+    
+    summary = {
+        'model_path': str(best_model_path),
+        'n_samples': len(results['IID']),
+        'IID_fullgrid': iid_fullgrid,
+        'IID_mid': iid_mid,
+        'IID_caustic': iid_caustic,
+        'IID_highfreq': iid_highfreq,
+        'OOD_range_70_30': ood_70_30,
+        'OOD_range_far': ood_far,
+        'delta_TL': delta_tl,
+    }
+    
+    print("\n=== Stage4 OOD Eval Results ===")
+    for k, v in summary.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f} dB")
+        else:
+            print(f"  {k}: {v}")
+    
     with open(stage_root / 'stage4_summary.json', 'w') as f:
-        json.dump({'results': results, 'params': best_params}, f, indent=2)
+        json.dump(summary, f, indent=2)
 
 
 def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
@@ -621,8 +729,9 @@ def main():
         args.batch_size = 8
         stage3_prime(args, cfg)
     elif args.stage == 'stage4':
-        if args.epochs == 12:
-            args.epochs = 60
+        # No training, just eval - use all data
+        args.limit_files = None
+        args.pts_per_map = 8192
         stage4_eval_ood(args, cfg)
     elif args.stage == 'stage5':
         args.limit_files = None
