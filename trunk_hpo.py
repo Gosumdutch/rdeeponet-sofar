@@ -516,6 +516,7 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     # Find best model from stage3_prime (wd=1e-4) or stage3
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage4_ood')
     best_model_candidates = [
+        Path(args.output_root) / args.study / 'stage3_single' / 'wd_1e-04' / 'best.pt',
         Path(args.output_root) / args.study / 'stage3_prime' / 'wd_1e-04' / 'best.pt',
         Path(args.output_root) / args.study / 'stage3' / 'seed_1' / 'best.pt',
         Path(args.output_root) / args.study / 'stage2' / 'trial_00000' / 'best.pt',
