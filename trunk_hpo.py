@@ -443,8 +443,13 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
         raise FileNotFoundError(f"No best model found. Checked: {best_model_candidates}")
     
     print(f"Loading model from: {best_model_path}")
-    checkpoint = torch.load(best_model_path, map_location='cpu')
-    model_cfg = checkpoint.get('config', cfg.get('model', {}))
+    checkpoint = torch.load(best_model_path, map_location='cpu', weights_only=False)
+    # Extract model config - may be nested under 'model' key
+    saved_cfg = checkpoint.get('config', {})
+    if 'model' in saved_cfg:
+        model_cfg = saved_cfg['model']
+    else:
+        model_cfg = cfg.get('model', {})
     
     # Build model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
