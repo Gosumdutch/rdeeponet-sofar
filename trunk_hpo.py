@@ -442,21 +442,32 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     if best_model_path is None:
         raise FileNotFoundError(f"No best model found. Checked: {best_model_candidates}")
     
+    # Load params from stage3 summary to build correct model config
+    best_params = load_best_params_for_eval(args)
+    
+    # Build model config from params
+    sigma_bank = best_params.get('sigma_bank', 'three_level')
+    sigma_list = SIGMA_PRESETS.get(sigma_bank, SIGMA_PRESETS['three_level'])[0]
+    dim_total = best_params.get('trunk_fourier_dim_total', 1536)
+    ratio_str = best_params.get('low_high_dim_ratio', '70_30')
+    ratio = 0.7 if ratio_str == '70_30' else 0.5
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    depth = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 6))
+    
+    model_cfg = {
+        'K': cfg.get('model', {}).get('K', 256),
+        'hidden': best_params.get('trunk_hidden', 768),
+        'depth': depth,
+        'trunk_type': 'ff',
+        'trunk_cond_mode': best_params.get('trunk_cond_mode', 'concat'),
+        'trunk_fourier_sigmas': sigma_list,
+        'trunk_fourier_dims': fourier_dims,
+        'film_gain': best_params.get('trunk_film_gain', 1.0),
+    }
+    print(f"Model config: {model_cfg}")
+    
     print(f"Loading model from: {best_model_path}")
     checkpoint = torch.load(best_model_path, map_location='cpu', weights_only=False)
-    # Extract model config - may be nested under 'model' key
-    saved_cfg = checkpoint.get('config', {})
-    if 'model' in saved_cfg:
-        model_cfg = saved_cfg['model']
-    else:
-        model_cfg = cfg.get('model', {})
-    
-    # Filter only valid RDeepONetV2 kwargs
-    valid_keys = {'K', 'pretrained', 'dropout', 'L', 'hidden', 'depth', 'cond_hidden', 'cond_out',
-                  'branch_variant', 'branch_params', 'branch_out_dim', 'film_layers', 'film_gain',
-                  'trunk_type', 'trunk_cond_mode', 'trunk_fourier_dim', 'trunk_fourier_sigma',
-                  'trunk_fourier_sigmas', 'trunk_fourier_dims', 'trunk_w0'}
-    model_cfg = {k: v for k, v in model_cfg.items() if k in valid_keys}
     
     # Build model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
