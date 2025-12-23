@@ -317,11 +317,26 @@ def stage3(args, cfg: Dict[str, Any]) -> None:
     study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
     best_params = dict(study2.best_params)
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage3')
+    
+    # Compute FF-MLP params from best_params
+    sigma_bank = best_params.get('sigma_bank', 'three_level')
+    sigma_list = SIGMA_PRESETS.get(sigma_bank, SIGMA_PRESETS['three_level'])[0]
+    dim_total = best_params.get('trunk_fourier_dim_total', 1536)
+    ratio_str = best_params.get('low_high_dim_ratio', '70_30')
+    ratio = 0.7 if ratio_str == '70_30' else 0.5
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    
     seeds = [0, 1, 2]  # Changed from [42, 43, 44]
     results = []
     for s in seeds:
         run_dir = stage_root / f"seed_{s}"
         overrides = dict(best_params)
+        # Add FF-MLP params
+        overrides['trunk_type'] = 'ff'
+        overrides['trunk_fourier_sigmas'] = sigma_list
+        overrides['trunk_fourier_dims'] = fourier_dims
+        overrides['trunk_hidden'] = best_params.get('trunk_hidden', 768)
+        overrides['trunk_depth'] = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 6))
         overrides.update({
             'outdir': str(run_dir),
             'epochs': args.epochs,
@@ -364,6 +379,14 @@ def stage3_prime(args, cfg: Dict[str, Any]) -> None:
     best_params = dict(study2.best_params)
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage3_prime')
     
+    # Compute FF-MLP params from best_params
+    sigma_bank = best_params.get('sigma_bank', 'three_level')
+    sigma_list = SIGMA_PRESETS.get(sigma_bank, SIGMA_PRESETS['three_level'])[0]
+    dim_total = best_params.get('trunk_fourier_dim_total', 1536)
+    ratio_str = best_params.get('low_high_dim_ratio', '70_30')
+    ratio = 0.7 if ratio_str == '70_30' else 0.5
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    
     # Fixed params from Stage2 best, only vary weight_decay
     wd_grid = [0.0, 1e-6, 1e-5, 1e-4, 1e-3, 4e-3]
     results = []
@@ -372,6 +395,12 @@ def stage3_prime(args, cfg: Dict[str, Any]) -> None:
         run_dir = stage_root / f"wd_{wd:.0e}" if wd > 0 else stage_root / "wd_0"
         overrides = dict(best_params)
         overrides['weight_decay'] = wd
+        # Add FF-MLP params
+        overrides['trunk_type'] = 'ff'
+        overrides['trunk_fourier_sigmas'] = sigma_list
+        overrides['trunk_fourier_dims'] = fourier_dims
+        overrides['trunk_hidden'] = best_params.get('trunk_hidden', 768)
+        overrides['trunk_depth'] = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 6))
         overrides.update({
             'outdir': str(run_dir),
             'epochs': args.epochs,
@@ -402,6 +431,63 @@ def stage3_prime(args, cfg: Dict[str, Any]) -> None:
         'wd_grid': wd_grid
     }
     with open(stage_root / 'stage3_prime_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def stage3_single(args, cfg: Dict[str, Any]) -> None:
+    """Stage3-Single: Single run with wd=1e-4 using FF-MLP."""
+    study2_name = f"{args.study}_stage2"
+    study2 = get_study(study2_name, args.storage.replace('.db', '_stage2.db'))
+    best_params = dict(study2.best_params)
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage3_single')
+    
+    # Compute FF-MLP params from best_params
+    sigma_bank = best_params.get('sigma_bank', 'three_level')
+    sigma_list = SIGMA_PRESETS.get(sigma_bank, SIGMA_PRESETS['three_level'])[0]
+    dim_total = best_params.get('trunk_fourier_dim_total', 1536)
+    ratio_str = best_params.get('low_high_dim_ratio', '70_30')
+    ratio = 0.7 if ratio_str == '70_30' else 0.5
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    
+    run_dir = stage_root / "wd_1e-04"
+    overrides = dict(best_params)
+    overrides['weight_decay'] = 1e-4
+    # Add FF-MLP params
+    overrides['trunk_type'] = 'ff'
+    overrides['trunk_fourier_sigmas'] = sigma_list
+    overrides['trunk_fourier_dims'] = fourier_dims
+    overrides['trunk_hidden'] = best_params.get('trunk_hidden', 768)
+    overrides['trunk_depth'] = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 6))
+    overrides.update({
+        'outdir': str(run_dir),
+        'epochs': args.epochs,
+        'limit_files': args.limit_files,
+        'pts_per_map': args.pts_per_map,
+        'batch_size': args.batch_size,
+        'use_amp': True,
+        'seed': 0,
+    })
+    
+    print(f"Running stage3_single with FF-MLP:")
+    print(f"  trunk_type: ff")
+    print(f"  sigma_bank: {sigma_bank}")
+    print(f"  fourier_sigmas: {sigma_list}")
+    print(f"  fourier_dims: {fourier_dims}")
+    print(f"  trunk_hidden: {overrides['trunk_hidden']}")
+    print(f"  trunk_depth: {overrides['trunk_depth']}")
+    print(f"  weight_decay: {overrides['weight_decay']}")
+    
+    result = fit_one_trial(cfg, overrides=overrides, trial=None,
+                           force_no_physics=True, force_amp=True)
+    summary = {
+        'mae_fullgrid': result.get('best_mae_db'),
+        'mae_mid': result.get('val_mae_mid_db'),
+        'mae_caustic': result.get('val_mae_caustic_db'),
+        'mae_highfreq': result.get('val_mae_highfreq_db'),
+        'params': overrides,
+        'result': result
+    }
+    with open(stage_root / 'stage3_single_summary.json', 'w') as f:
         json.dump(summary, f, indent=2)
 
 
@@ -714,7 +800,7 @@ def main():
     ap.add_argument('--storage', type=str, default='sqlite:///experiments/optuna/trunk_global.db')
     ap.add_argument('--output-root', type=str, default='experiments/trunk_hpo')
     ap.add_argument('--stage', type=str, required=True,
-                    choices=['stage0', 'stage1', 'stage2', 'stage3', 'stage3_prime', 'stage4', 'stage5', 'stage6', 'stage7'])
+                    choices=['stage0', 'stage1', 'stage2', 'stage3', 'stage3_prime', 'stage3_single', 'stage4', 'stage5', 'stage6', 'stage7'])
     ap.add_argument('--n-trials', type=int, default=36)
     ap.add_argument('--epochs', type=int, default=12)
     ap.add_argument('--limit-files', type=int, default=200)
@@ -758,6 +844,13 @@ def main():
         args.pts_per_map = 8192
         args.batch_size = 8
         stage3_prime(args, cfg)
+    elif args.stage == 'stage3_single':
+        if args.epochs == 12:
+            args.epochs = 60
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage3_single(args, cfg)
     elif args.stage == 'stage4':
         # No training, just eval - use all data
         args.limit_files = None
