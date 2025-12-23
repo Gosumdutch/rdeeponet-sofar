@@ -461,7 +461,14 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     # Build model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = RDeepONetV2(**model_cfg).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Handle different checkpoint formats
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['state_dict'])
+    else:
+        # Assume checkpoint is the state_dict itself
+        model.load_state_dict(checkpoint)
     model.eval()
     
     # Load validation dataset
