@@ -723,7 +723,7 @@ def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
                 lr = trial.suggest_loguniform('lr', 4e-4, 1.0e-3)
         
         # Warmup ratio
-        warmup_ratio = trial.suggest_categorical('warmup_ratio', [0.03, 0.05, 0.10])
+        warmup_ratio = trial.suggest_categorical('warmup_ratio', [0.03, 0.05, 0.08])
         warmup_epochs = max(1, int(epochs * warmup_ratio))
         
         overrides = dict(best_params)
