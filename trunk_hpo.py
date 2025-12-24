@@ -673,52 +673,99 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
 
 
 def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
+    """Stage5: Epoch/LR/Warmup tuning with fixed FF-MLP architecture."""
     best_params = load_best_params_for_eval(args)
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage5_epoch')
     study_name = f"{args.study}_stage5_epoch"
-    # No ASHA (pruner=None) because epoch is budget variable
+    # No pruner - epoch is budget variable
     sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=10)
     study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', '_stage5.db'),
-                                load_if_exists=True, sampler=sampler, direction='minimize')
+                                load_if_exists=True, sampler=sampler, direction='minimize', pruner=None)
+    
+    # Fixed FF-MLP params from Stage3
+    sigma_bank = best_params.get('sigma_bank', 'three_level')
+    sigma_list = SIGMA_PRESETS.get(sigma_bank, SIGMA_PRESETS['three_level'])[0]
+    dim_total = best_params.get('trunk_fourier_dim_total', 1536)
+    ratio_str = best_params.get('low_high_dim_ratio', '70_30')
+    ratio = 0.7 if ratio_str == '70_30' else 0.5
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    depth = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 7))
+    
+    # Track long-epoch trials to limit to 20%
+    long_epoch_count = [0]
+    max_long_trials = max(1, int(args.n_trials * 0.2))
 
     def objective(trial: optuna.Trial):
+        # Epochs: {60, 75, 90, 105, 120, 150, 180}
+        epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105, 120, 150, 180])
+        
+        # Limit epochs >= 120 to 20% of trials
+        if epochs >= 120:
+            if long_epoch_count[0] >= max_long_trials:
+                # Force shorter epoch
+                epochs = trial.suggest_categorical('epochs_fallback', [60, 75, 90, 105])
+            else:
+                long_epoch_count[0] += 1
+        
+        # LR: epoch-conditional
+        if epochs <= 60:
+            lr = trial.suggest_loguniform('lr', 5e-4, 1.2e-3)
+        elif epochs >= 150:
+            lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
+        elif epochs >= 90:
+            lr = trial.suggest_loguniform('lr', 3e-4, 9e-4)
+        else:
+            lr = trial.suggest_loguniform('lr', 4e-4, 1.0e-3)
+        
+        # Warmup ratio
+        warmup_ratio = trial.suggest_categorical('warmup_ratio', [0.03, 0.05, 0.10])
+        warmup_epochs = max(1, int(epochs * warmup_ratio))
+        
         overrides = dict(best_params)
+        # Fixed FF-MLP params
+        overrides['trunk_type'] = 'ff'
+        overrides['trunk_fourier_sigmas'] = sigma_list
+        overrides['trunk_fourier_dims'] = fourier_dims
+        overrides['trunk_hidden'] = best_params.get('trunk_hidden', 768)
+        overrides['trunk_depth'] = depth
+        overrides['trunk_cond_mode'] = 'concat'
+        overrides['weight_decay'] = 1e-4  # Fixed from Stage3-Prime winner
+        
         overrides.update({
-            'epochs': trial.suggest_categorical('epochs_tune', [60, 90, 120, 180]),
+            'epochs': epochs,
+            'lr': lr,
+            'warmup_epochs': warmup_epochs,
             'outdir': str(stage_root / f"trial_{trial.number:05d}"),
             'limit_files': args.limit_files,
             'pts_per_map': args.pts_per_map,
             'batch_size': args.batch_size,
             'use_amp': True,
+            'seed': 0,
         })
-        # lr/wd + physics DVs
-        overrides['lr'] = trial.suggest_loguniform('lr', 6e-4, 2.0e-3)
-        overrides['weight_decay'] = trial.suggest_loguniform('weight_decay', 1e-7, 5e-3)
-        overrides['loss_type'] = 'huber'
-        overrides['huber_delta'] = trial.suggest_categorical('huber_delta', [0.5, 1.0, 1.5])
-        lambda_rec = trial.suggest_loguniform('lambda_rec', 1e-4, 1e-2)
-        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
-        overrides['loss_reciprocity_weight'] = lambda_rec
-        overrides['loss_smooth_weight'] = 0.0
-        overrides['loss_tv_weight'] = 0.0
-        if reg_type == 'grad':
-            overrides['loss_smooth_weight'] = trial.suggest_loguniform('lambda_grad', 1e-6, 3e-4)
-        elif reg_type == 'tv':
-            overrides['loss_tv_weight'] = trial.suggest_loguniform('lambda_tv', 1e-6, 1e-4)
-        overrides['physics_warmup_epochs'] = trial.suggest_categorical('physics_warmup_epochs', [20, 30, 40])
+        
         res = fit_one_trial(cfg, overrides=overrides, trial=trial,
-                            force_no_physics=False, force_amp=True, enable_gate=False)
+                            force_no_physics=True, force_amp=True, enable_gate=False)
         return float(res['best_mae_db'])
 
     study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
     trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+    
+    summary = {
+        'best_value': study.best_value,
+        'best_params': study.best_params,
+        'fixed_params': {
+            'trunk_type': 'ff',
+            'sigma_bank': sigma_bank,
+            'fourier_dim_total': dim_total,
+            'dim_ratio': ratio_str,
+            'depth': depth,
+            'weight_decay': 1e-4,
+        },
+        'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
+    }
     with open(stage_root / 'stage5_summary.json', 'w') as f:
-        json.dump({
-            'best_value': study.best_value,
-            'best_params': study.best_params,
-            'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
-        }, f, indent=2)
+        json.dump(summary, f, indent=2)
 
 
 def stage6_physics(args, cfg: Dict[str, Any]) -> None:
