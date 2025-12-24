@@ -673,13 +673,24 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
 
 
 def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
-    """Stage5: Epoch/LR/Warmup tuning with fixed FF-MLP architecture."""
+    """Stage5: Epoch/LR/Warmup tuning with fixed FF-MLP architecture.
+    
+    Use --epoch-split to run on separate instances:
+      'short': epochs {60, 75, 90, 105}, lr [4e-4, 1.2e-3]
+      'long':  epochs {120, 150, 180}, lr [2e-4, 7e-4]
+      'all':   full range (default)
+    """
     best_params = load_best_params_for_eval(args)
-    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage5_epoch')
-    study_name = f"{args.study}_stage5_epoch"
+    
+    # Determine epoch split mode
+    epoch_split = getattr(args, 'epoch_split', 'all')
+    stage_suffix = f"_stage5_{epoch_split}" if epoch_split != 'all' else '_stage5_epoch'
+    stage_root = ensure_dir(Path(args.output_root) / args.study / f'stage5_{epoch_split}')
+    study_name = f"{args.study}{stage_suffix}"
+    
     # No pruner - epoch is budget variable
-    sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=10)
-    study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', '_stage5.db'),
+    sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=5)
+    study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', f'_stage5_{epoch_split}.db'),
                                 load_if_exists=True, sampler=sampler, direction='minimize', pruner=None)
     
     # Fixed FF-MLP params from Stage3
@@ -690,32 +701,26 @@ def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
     ratio = 0.7 if ratio_str == '70_30' else 0.5
     fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
     depth = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 7))
-    
-    # Track long-epoch trials to limit to 20%
-    long_epoch_count = [0]
-    max_long_trials = max(1, int(args.n_trials * 0.2))
 
     def objective(trial: optuna.Trial):
-        # Epochs: {60, 75, 90, 105, 120, 150, 180}
-        epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105, 120, 150, 180])
-        
-        # Limit epochs >= 120 to 20% of trials
-        if epochs >= 120:
-            if long_epoch_count[0] >= max_long_trials:
-                # Force shorter epoch
-                epochs = trial.suggest_categorical('epochs_fallback', [60, 75, 90, 105])
-            else:
-                long_epoch_count[0] += 1
-        
-        # LR: epoch-conditional
-        if epochs <= 60:
-            lr = trial.suggest_loguniform('lr', 5e-4, 1.2e-3)
-        elif epochs >= 150:
+        # Epochs based on split mode
+        if epoch_split == 'short':
+            epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105])
+            lr = trial.suggest_loguniform('lr', 4e-4, 1.2e-3)
+        elif epoch_split == 'long':
+            epochs = trial.suggest_categorical('epochs', [120, 150, 180])
             lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
-        elif epochs >= 90:
-            lr = trial.suggest_loguniform('lr', 3e-4, 9e-4)
-        else:
-            lr = trial.suggest_loguniform('lr', 4e-4, 1.0e-3)
+        else:  # 'all'
+            epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105, 120, 150, 180])
+            # LR: epoch-conditional
+            if epochs <= 60:
+                lr = trial.suggest_loguniform('lr', 5e-4, 1.2e-3)
+            elif epochs >= 150:
+                lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
+            elif epochs >= 90:
+                lr = trial.suggest_loguniform('lr', 3e-4, 9e-4)
+            else:
+                lr = trial.suggest_loguniform('lr', 4e-4, 1.0e-3)
         
         # Warmup ratio
         warmup_ratio = trial.suggest_categorical('warmup_ratio', [0.03, 0.05, 0.10])
@@ -754,6 +759,7 @@ def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
     summary = {
         'best_value': study.best_value,
         'best_params': study.best_params,
+        'epoch_split': epoch_split,
         'fixed_params': {
             'trunk_type': 'ff',
             'sigma_bank': sigma_bank,
@@ -858,6 +864,8 @@ def main():
     ap.add_argument('--timeout-hours', type=float, default=8.0)
     ap.add_argument('--eval-subset', type=int, default=256, help='Fixed eval subset size for stage1')
     ap.add_argument('--split-ids', nargs='*', default=None, help='OOD split ids for stage4')
+    ap.add_argument('--epoch-split', type=str, default='all', choices=['short', 'long', 'all'],
+                    help='Stage5 epoch range: short={60,75,90,105}, long={120,150,180}, all=full')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)
