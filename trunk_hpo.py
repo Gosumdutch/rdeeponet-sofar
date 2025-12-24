@@ -510,7 +510,7 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     import torch
     from dataset import RDeepONetH5
     from torch.utils.data import DataLoader
-    from train_runner import evaluate_mae_zones, mae_db_from_norm
+    from train_runner import evaluate_mae_zones, mae_db_from_norm, build_norm_cfg
     from models import RDeepONetV2
     
     # Find best model from stage3_prime (wd=1e-4) or stage3
@@ -570,9 +570,9 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
     model.eval()
     
     # Load validation dataset
-    norm_cfg = cfg.get('norm', {})
-    tl_min = norm_cfg.get('tl', {}).get('tl_min', 40.0)
-    tl_max = norm_cfg.get('tl', {}).get('tl_max', 120.0)
+    norm_cfg = build_norm_cfg(cfg)
+    tl_min = norm_cfg['tl_db']['min']
+    tl_max = norm_cfg['tl_db']['max']
     
     data_root = cfg['data'].get('root', cfg['data'].get('path', 'R-DeepONet_Data/data/h5'))
     val_ds = RDeepONetH5(
