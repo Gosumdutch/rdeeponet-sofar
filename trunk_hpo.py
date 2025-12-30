@@ -675,9 +675,10 @@ def stage4_eval_ood(args, cfg: Dict[str, Any]) -> None:
 def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
     """Stage5: Epoch/LR/Warmup tuning with fixed FF-MLP architecture.
     
-    Use --epoch-split to run on separate instances:
-      'short': epochs {60, 75, 90, 105}, lr [4e-4, 1.2e-3]
-      'long':  epochs {120, 150, 180}, lr [2e-4, 7e-4]
+    Use --epoch-split to run on 3 machines (time-balanced):
+      'short': Laptop (4070) - epochs {60, 75}, lr [5e-4, 1.2e-3]
+      'mid':   Pro A (4500)  - epochs {90, 180}, lr conditional
+      'long':  Pro B (4500)  - epochs {105, 120, 150}, lr conditional
       'all':   full range (default)
     """
     best_params = load_best_params_for_eval(args)
@@ -703,17 +704,29 @@ def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
     depth = best_params.get('trunk_depth_stage2', best_params.get('trunk_depth', 7))
 
     def objective(trial: optuna.Trial):
-        # Epochs based on split mode
+        # Epochs based on split mode (3-way split for 3 machines, time-balanced)
         if epoch_split == 'short':
-            epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105])
-            lr = trial.suggest_loguniform('lr', 4e-4, 1.2e-3)
+            # Laptop (RTX 4070): shortest epochs
+            epochs = trial.suggest_categorical('epochs', [60, 75])
+            lr = trial.suggest_loguniform('lr', 5e-4, 1.2e-3)
+        elif epoch_split == 'mid':
+            # Pro A (RTX Pro 4500): short + longest mixed
+            epochs = trial.suggest_categorical('epochs', [90, 180])
+            if epochs == 90:
+                lr = trial.suggest_loguniform('lr', 3e-4, 9e-4)
+            else:  # 180
+                lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
         elif epoch_split == 'long':
-            epochs = trial.suggest_categorical('epochs', [120, 150, 180])
-            lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
+            # Pro B (RTX Pro 4500): medium-long range
+            epochs = trial.suggest_categorical('epochs', [105, 120, 150])
+            if epochs <= 120:
+                lr = trial.suggest_loguniform('lr', 3e-4, 9e-4)
+            else:  # 150
+                lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
         else:  # 'all'
             epochs = trial.suggest_categorical('epochs', [60, 75, 90, 105, 120, 150, 180])
             # LR: epoch-conditional
-            if epochs <= 60:
+            if epochs <= 75:
                 lr = trial.suggest_loguniform('lr', 5e-4, 1.2e-3)
             elif epochs >= 150:
                 lr = trial.suggest_loguniform('lr', 2e-4, 7e-4)
@@ -864,8 +877,8 @@ def main():
     ap.add_argument('--timeout-hours', type=float, default=8.0)
     ap.add_argument('--eval-subset', type=int, default=256, help='Fixed eval subset size for stage1')
     ap.add_argument('--split-ids', nargs='*', default=None, help='OOD split ids for stage4')
-    ap.add_argument('--epoch-split', type=str, default='all', choices=['short', 'long', 'all'],
-                    help='Stage5 epoch range: short={60,75,90,105}, long={120,150,180}, all=full')
+    ap.add_argument('--epoch-split', type=str, default='all', choices=['short', 'mid', 'long', 'all'],
+                    help='Stage5 epoch split: short={60,75}, mid={90,180}, long={105,120,150}, all=full')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)
