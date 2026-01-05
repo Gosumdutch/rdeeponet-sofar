@@ -142,6 +142,43 @@ def save_debug_figures(model: nn.Module,
     fig.savefig(figures_dir / 'debug_maps.png', dpi=200)
     plt.close(fig)
 
+    # High-frequency zone comparison (top 10% grad magnitude of GT)
+    gt_np = tl_gt.numpy()
+    pred_np = tl_pred.numpy()
+    diff_np = np.abs(pred_np - gt_np)
+    try:
+        gy, gx = np.gradient(gt_np)
+    except Exception:
+        gx = np.zeros_like(gt_np)
+        gy = np.zeros_like(gt_np)
+        gx[:, :-1] = gt_np[:, 1:] - gt_np[:, :-1]
+        gx[:, -1] = gx[:, -2]
+        gy[:-1, :] = gt_np[1:, :] - gt_np[:-1, :]
+        gy[-1, :] = gy[-2, :]
+    grad_mag = np.sqrt(np.maximum(gx ** 2 + gy ** 2, 0))
+    if grad_mag.size > 0:
+        thr = np.quantile(grad_mag.flatten(), 0.9)
+        mask = grad_mag > thr
+    else:
+        mask = np.zeros_like(grad_mag, dtype=bool)
+
+    gt_masked = np.where(mask, gt_np, 0.0)
+    pred_masked = np.where(mask, pred_np, 0.0)
+    diff_masked = np.where(mask, diff_np, 0.0)
+
+    fig_hf, axes_hf = plt.subplots(1, 4, figsize=(16, 4))
+    axes_hf[0].imshow(mask.astype(np.float32), cmap='gray', origin='lower')
+    axes_hf[0].set_title('Highfreq Mask')
+    axes_hf[1].imshow(gt_masked, cmap='viridis', origin='lower', vmin=0, vmax=1)
+    axes_hf[1].set_title('GT (masked)')
+    axes_hf[2].imshow(pred_masked, cmap='viridis', origin='lower', vmin=0, vmax=1)
+    axes_hf[2].set_title('Pred (masked)')
+    axes_hf[3].imshow(diff_masked, cmap='magma', origin='lower')
+    axes_hf[3].set_title('Abs Diff (masked)')
+    fig_hf.tight_layout()
+    fig_hf.savefig(figures_dir / 'highfreq_zone.png', dpi=200)
+    plt.close(fig_hf)
+
 
 def make_datasets(cfg: Dict[str, Any], split_ratio: Dict[str, float], overrides: Optional[Dict[str, Any]] = None) -> Tuple[RDeepONetH5, RDeepONetH5]:
     data_cfg = cfg['data']

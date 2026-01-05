@@ -787,46 +787,396 @@ def stage5_epoch_tune(args, cfg: Dict[str, Any]) -> None:
         json.dump(summary, f, indent=2)
 
 
+def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    sigma_bank = 'three_level'
+    sigma_list = SIGMA_PRESETS[sigma_bank][0]
+    dim_total = 1536
+    ratio = 0.7
+    fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
+    epochs = 180
+    warmup_epochs = max(1, int(epochs * 0.05))
+
+    fixed_overrides = {
+        'trunk_type': 'ff',
+        'trunk_fourier_sigmas': sigma_list,
+        'trunk_fourier_dims': fourier_dims,
+        'trunk_hidden': 768,
+        'trunk_depth': 7,
+        'trunk_cond_mode': 'concat',
+        'trunk_fourier_dim_total': dim_total,
+        'low_high_dim_ratio': '70_30',
+        'edge_weight_scale': 8,
+        'epochs': epochs,
+        'lr': 2.8e-4,
+        'warmup_epochs': warmup_epochs,
+        'weight_decay': 1e-4,
+        'limit_files': None,
+        'pts_per_map': args.pts_per_map,
+        'batch_size': args.batch_size,
+        'use_amp': True,
+        'seed': 42,
+        'grace_epochs': epochs + 1,
+        'patience': epochs + 1,
+    }
+    meta = {
+        'epochs': epochs,
+        'lr': 2.8e-4,
+        'warmup_ratio': 0.05,
+        'weight_decay': 1e-4,
+        'trunk_type': 'ff',
+        'sigma_bank': sigma_bank,
+        'fourier_dim_total': dim_total,
+        'dim_ratio': '70_30',
+        'depth': 7,
+        'cond_mode': 'concat',
+    }
+    return fixed_overrides, meta
+
+
 def stage6_physics(args, cfg: Dict[str, Any]) -> None:
-    best_params = load_best_params_for_eval(args)
+    import torch
+    from torch.utils.data import DataLoader
+    from train_runner import build_norm_cfg, compute_zone_mae, build_model, make_datasets
+    from utils_eval import infer_full_map, mae_db_from_norm
+
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage6_physics')
     study_name = f"{args.study}_stage6_physics"
-    study = get_study(study_name, args.storage.replace('.db', '_stage6.db'))
+
+    sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=6)
+    pruner = SuccessiveHalvingPruner(min_resource=10, reduction_factor=3, min_early_stopping_rate=0)
+    study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', '_stage6.db'),
+                                load_if_exists=True, sampler=sampler, pruner=pruner, direction='minimize')
+
+    fixed_overrides, fixed_meta = build_stage6_fixed_overrides(args)
+    ood_eval_mode = args.stage6_ood_eval_mode
+    ood_lite_count = max(1, int(args.stage6_ood_lite_count))
+
+    split_ratio = {'train': 0.8, 'val': 0.2}
+    eval_overrides = dict(fixed_overrides)
+    eval_overrides['pts_per_map'] = args.pts_per_map
+    _, val_ds_full = make_datasets(cfg, split_ratio, eval_overrides)
+    val_loader = DataLoader(val_ds_full, batch_size=1, shuffle=False, num_workers=0)
+    ood_lite_count = min(ood_lite_count, len(val_ds_full))
+    ood_lite_indices = set(range(ood_lite_count))
+
+    def eval_iid_ood_metrics(model_path: Path, overrides: Dict[str, Any]) -> Dict[str, Any]:
+        norm_cfg = build_norm_cfg(cfg)
+        tl_min = norm_cfg['tl_db']['min']
+        tl_max = norm_cfg['tl_db']['max']
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = build_model(cfg, overrides).to(device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        model.eval()
+
+        results = {'IID': [], 'OOD_range_70_30': [], 'OOD_range_far': []}
+        with torch.no_grad():
+            for idx, batch in enumerate(val_loader):
+                ray = batch['ray'].to(device)
+                cond = batch['cond'].to(device)
+                tl_gt_norm = batch['tl'].cpu().squeeze()
+
+                tl_pred_norm = infer_full_map(model, ray, cond, device=device)
+
+                H, W = tl_gt_norm.shape
+                r_coords = torch.linspace(0, 1, W)
+                iid_mask = r_coords <= 0.7
+                ood_mask = r_coords > 0.7
+                far_mask = r_coords > 0.8
+
+                def zone_mae(pred, gt, mask):
+                    mask_2d = mask.unsqueeze(0).expand(H, -1)
+                    if not mask_2d.any():
+                        return None
+                    pred_zone = pred[mask_2d]
+                    gt_zone = gt[mask_2d]
+                    return mae_db_from_norm(pred_zone, gt_zone, tl_min, tl_max).item()
+
+                iid_mae = zone_mae(tl_pred_norm, tl_gt_norm, iid_mask)
+                ood_mae = None
+                far_mae = None
+                if ood_eval_mode == 'full' or idx in ood_lite_indices:
+                    ood_mae = zone_mae(tl_pred_norm, tl_gt_norm, ood_mask)
+                    far_mae = zone_mae(tl_pred_norm, tl_gt_norm, far_mask)
+
+                overall, mid, caustic, highfreq = compute_zone_mae(
+                    tl_pred_norm.unsqueeze(0).unsqueeze(0),
+                    tl_gt_norm.unsqueeze(0).unsqueeze(0),
+                    tl_min, tl_max
+                )
+                results['IID'].append({'mae': iid_mae, 'overall': overall, 'mid': mid,
+                                       'caustic': caustic, 'highfreq': highfreq})
+                if ood_mae is not None:
+                    results['OOD_range_70_30'].append({'mae': ood_mae})
+                if far_mae is not None:
+                    results['OOD_range_far'].append({'mae': far_mae})
+
+        def avg(lst, key='mae'):
+            vals = [x[key] for x in lst if x.get(key) is not None]
+            return float(sum(vals) / len(vals)) if vals else None
+
+        iid_fullgrid = avg(results['IID'], 'overall')
+        iid_mid = avg(results['IID'], 'mid')
+        iid_caustic = avg(results['IID'], 'caustic')
+        iid_highfreq = avg(results['IID'], 'highfreq')
+        ood_70_30 = avg(results['OOD_range_70_30'])
+        ood_far = avg(results['OOD_range_far'])
+        delta_70_30 = (ood_70_30 - iid_fullgrid) if (ood_70_30 is not None and iid_fullgrid is not None) else None
+        delta_far = (ood_far - iid_fullgrid) if (ood_far is not None and iid_fullgrid is not None) else None
+
+        return {
+            'model_path': str(model_path),
+            'n_samples': len(results['IID']),
+            'ood_samples': len(results['OOD_range_70_30']),
+            'ood_eval_mode': ood_eval_mode,
+            'ood_lite_count': ood_lite_count,
+            'IID_fullgrid': iid_fullgrid,
+            'IID_mid': iid_mid,
+            'IID_caustic': iid_caustic,
+            'IID_highfreq': iid_highfreq,
+            'OOD_range_70_30': ood_70_30,
+            'OOD_range_far': ood_far,
+            'delta_70_30': delta_70_30,
+            'delta_far': delta_far,
+        }
+
+    def compute_objective(metrics: Dict[str, Any]) -> float:
+        mae_iid = metrics.get('IID_fullgrid')
+        mae_highfreq = metrics.get('IID_highfreq')
+        delta_70_30 = metrics.get('delta_70_30')
+        delta_far = metrics.get('delta_far')
+        if None in (mae_iid, mae_highfreq, delta_70_30, delta_far):
+            return float('inf')
+        highfreq_pen = max(0.0, float(mae_highfreq) - float(mae_iid) - 0.12)
+        ood_70_pen = max(0.0, float(delta_70_30) - 0.08)
+        ood_far_pen = max(0.0, float(delta_far) - 0.25)
+        return float(mae_iid) + 2.0 * highfreq_pen + 1.0 * ood_70_pen + 0.5 * ood_far_pen
 
     def objective(trial: optuna.Trial):
-        overrides = dict(best_params)
+        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
+        huber_delta = trial.suggest_categorical('huber_delta', [0.5, 1.0, 1.5])
+        physics_warmup_epochs = trial.suggest_categorical('physics_warmup_epochs', [60, 80, 100])
+        lambda_rec = trial.suggest_loguniform('loss_reciprocity_weight', 1e-5, 1e-2)
+        lambda_grad = 0.0
+        lambda_tv = 0.0
+        if reg_type == 'grad':
+            lambda_grad = trial.suggest_loguniform('loss_smooth_weight', 1e-7, 1e-4)
+        elif reg_type == 'tv':
+            lambda_tv = trial.suggest_loguniform('loss_tv_weight', 1e-7, 1e-5)
+
+        overrides = dict(fixed_overrides)
         overrides.update({
             'outdir': str(stage_root / f"trial_{trial.number:05d}"),
-            'epochs': args.epochs,
-            'limit_files': args.limit_files,
-            'pts_per_map': args.pts_per_map,
-            'batch_size': args.batch_size,
-            'use_amp': True,
             'loss_type': 'huber',
-            'huber_delta': trial.suggest_uniform('huber_delta', 0.5, 1.5),
+            'huber_delta': huber_delta,
+            'loss_reciprocity_weight': lambda_rec,
+            'loss_smooth_weight': lambda_grad,
+            'loss_tv_weight': lambda_tv,
+            'physics_warmup_epochs': physics_warmup_epochs,
         })
-        lambda_rec = trial.suggest_loguniform('lambda_rec', 1e-5, 5e-2)
-        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
-        overrides['loss_reciprocity_weight'] = lambda_rec
-        overrides['loss_smooth_weight'] = 0.0
-        overrides['loss_tv_weight'] = 0.0
-        if reg_type == 'grad':
-            overrides['loss_smooth_weight'] = trial.suggest_loguniform('lambda_grad', 1e-6, 1e-3)
-        elif reg_type == 'tv':
-            overrides['loss_tv_weight'] = trial.suggest_loguniform('lambda_tv', 1e-6, 1e-3)
+
         res = fit_one_trial(cfg, overrides=overrides, trial=trial,
                             force_no_physics=False, force_amp=True, enable_gate=False)
-        return float(res['best_mae_db'])
+        model_path = Path(overrides['outdir']) / 'best.pt'
+        metrics = eval_iid_ood_metrics(model_path, overrides)
+        obj = compute_objective(metrics)
+
+        trial_summary = {
+            'trial_number': trial.number,
+            'objective': obj,
+            'params': {
+                'reg_type': reg_type,
+                'huber_delta': huber_delta,
+                'physics_warmup_epochs': physics_warmup_epochs,
+                'loss_reciprocity_weight': lambda_rec,
+                'loss_smooth_weight': lambda_grad,
+                'loss_tv_weight': lambda_tv,
+            },
+            'metrics': metrics,
+            'fit_result': res,
+        }
+        with open(Path(overrides['outdir']) / 'stage6_trial_summary.json', 'w') as f:
+            json.dump(trial_summary, f, indent=2)
+
+        trial.set_user_attr('metrics', metrics)
+        trial.set_user_attr('objective', obj)
+        return obj
 
     study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
     trials_sorted = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     trials_sorted = sorted(trials_sorted, key=lambda t: t.value)
+
+    summary = {
+        'best_value': study.best_value,
+        'best_params': study.best_params,
+        'fixed_params': fixed_meta,
+        'ood_eval_mode': ood_eval_mode,
+        'ood_lite_count': ood_lite_count,
+        'topk': [
+            {
+                'number': t.number,
+                'value': t.value,
+                'params': t.params,
+                'metrics': t.user_attrs.get('metrics')
+            }
+            for t in trials_sorted[:6]
+        ]
+    }
     with open(stage_root / 'stage6_summary.json', 'w') as f:
-        json.dump({
-            'best_value': study.best_value,
-            'best_params': study.best_params,
-            'topk': [{'number': t.number, 'value': t.value, 'params': t.params} for t in trials_sorted[:6]]
-        }, f, indent=2)
+        json.dump(summary, f, indent=2)
+
+
+def stage6_eval_topk(args, cfg: Dict[str, Any]) -> None:
+    import torch
+    from torch.utils.data import DataLoader
+    from train_runner import build_norm_cfg, compute_zone_mae, build_model, make_datasets
+    from utils_eval import infer_full_map, mae_db_from_norm
+
+    stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage6_physics')
+    summary_path = stage_root / 'stage6_summary.json'
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Missing stage6 summary: {summary_path}")
+    summary = json.loads(summary_path.read_text())
+    topk = summary.get('topk', [])[:args.stage6_topk]
+
+    fixed_overrides, fixed_meta = build_stage6_fixed_overrides(args)
+
+    split_ratio = {'train': 0.8, 'val': 0.2}
+    eval_overrides = dict(fixed_overrides)
+    eval_overrides['pts_per_map'] = args.pts_per_map
+    _, val_ds_full = make_datasets(cfg, split_ratio, eval_overrides)
+    val_loader = DataLoader(val_ds_full, batch_size=1, shuffle=False, num_workers=0)
+
+    def eval_full_ood(model_path: Path, overrides: Dict[str, Any]) -> Dict[str, Any]:
+        norm_cfg = build_norm_cfg(cfg)
+        tl_min = norm_cfg['tl_db']['min']
+        tl_max = norm_cfg['tl_db']['max']
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = build_model(cfg, overrides).to(device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+        model.eval()
+
+        results = {'IID': [], 'OOD_range_70_30': [], 'OOD_range_far': []}
+        with torch.no_grad():
+            for batch in val_loader:
+                ray = batch['ray'].to(device)
+                cond = batch['cond'].to(device)
+                tl_gt_norm = batch['tl'].cpu().squeeze()
+
+                tl_pred_norm = infer_full_map(model, ray, cond, device=device)
+
+                H, W = tl_gt_norm.shape
+                r_coords = torch.linspace(0, 1, W)
+                iid_mask = r_coords <= 0.7
+                ood_mask = r_coords > 0.7
+                far_mask = r_coords > 0.8
+
+                def zone_mae(pred, gt, mask):
+                    mask_2d = mask.unsqueeze(0).expand(H, -1)
+                    if not mask_2d.any():
+                        return None
+                    pred_zone = pred[mask_2d]
+                    gt_zone = gt[mask_2d]
+                    return mae_db_from_norm(pred_zone, gt_zone, tl_min, tl_max).item()
+
+                iid_mae = zone_mae(tl_pred_norm, tl_gt_norm, iid_mask)
+                ood_mae = zone_mae(tl_pred_norm, tl_gt_norm, ood_mask)
+                far_mae = zone_mae(tl_pred_norm, tl_gt_norm, far_mask)
+
+                overall, mid, caustic, highfreq = compute_zone_mae(
+                    tl_pred_norm.unsqueeze(0).unsqueeze(0),
+                    tl_gt_norm.unsqueeze(0).unsqueeze(0),
+                    tl_min, tl_max
+                )
+                results['IID'].append({'mae': iid_mae, 'overall': overall, 'mid': mid,
+                                       'caustic': caustic, 'highfreq': highfreq})
+                results['OOD_range_70_30'].append({'mae': ood_mae})
+                results['OOD_range_far'].append({'mae': far_mae})
+
+        def avg(lst, key='mae'):
+            vals = [x[key] for x in lst if x.get(key) is not None]
+            return float(sum(vals) / len(vals)) if vals else None
+
+        iid_fullgrid = avg(results['IID'], 'overall')
+        iid_mid = avg(results['IID'], 'mid')
+        iid_caustic = avg(results['IID'], 'caustic')
+        iid_highfreq = avg(results['IID'], 'highfreq')
+        ood_70_30 = avg(results['OOD_range_70_30'])
+        ood_far = avg(results['OOD_range_far'])
+        delta_70_30 = (ood_70_30 - iid_fullgrid) if (ood_70_30 is not None and iid_fullgrid is not None) else None
+        delta_far = (ood_far - iid_fullgrid) if (ood_far is not None and iid_fullgrid is not None) else None
+
+        return {
+            'model_path': str(model_path),
+            'n_samples': len(results['IID']),
+            'IID_fullgrid': iid_fullgrid,
+            'IID_mid': iid_mid,
+            'IID_caustic': iid_caustic,
+            'IID_highfreq': iid_highfreq,
+            'OOD_range_70_30': ood_70_30,
+            'OOD_range_far': ood_far,
+            'delta_70_30': delta_70_30,
+            'delta_far': delta_far,
+        }
+
+    top_root = ensure_dir(stage_root / 'topk_eval')
+    for entry in topk:
+        params = entry.get('params', {})
+        reg_type = params.get('reg_type', 'none')
+        huber_delta = params.get('huber_delta', 1.0)
+        physics_warmup_epochs = params.get('physics_warmup_epochs', 60)
+        lambda_rec = params.get('loss_reciprocity_weight', 0.0)
+        lambda_grad = 0.0
+        lambda_tv = 0.0
+        if reg_type == 'grad':
+            lambda_grad = params.get('loss_smooth_weight', 0.0)
+        elif reg_type == 'tv':
+            lambda_tv = params.get('loss_tv_weight', 0.0)
+
+        trial_number = entry.get('number', 0)
+        trial_root = ensure_dir(top_root / f"trial_{trial_number:05d}")
+        seed_results = []
+        for seed in [0, 1, 42]:
+            overrides = dict(fixed_overrides)
+            overrides.update({
+                'outdir': str(trial_root / f"seed_{seed}"),
+                'seed': seed,
+                'loss_type': 'huber',
+                'huber_delta': huber_delta,
+                'loss_reciprocity_weight': lambda_rec,
+                'loss_smooth_weight': lambda_grad,
+                'loss_tv_weight': lambda_tv,
+                'physics_warmup_epochs': physics_warmup_epochs,
+            })
+            res = fit_one_trial(cfg, overrides=overrides, trial=None,
+                                force_no_physics=False, force_amp=True, enable_gate=False)
+            model_path = Path(overrides['outdir']) / 'best.pt'
+            metrics = eval_full_ood(model_path, overrides)
+            metrics['seed'] = seed
+            metrics['fit_result'] = res
+            seed_results.append(metrics)
+            with open(Path(overrides['outdir']) / 'stage6_seed_summary.json', 'w') as f:
+                json.dump(metrics, f, indent=2)
+
+        with open(trial_root / 'stage6_topk_summary.json', 'w') as f:
+            json.dump({
+                'trial_number': trial_number,
+                'params': params,
+                'fixed_params': fixed_meta,
+                'seeds': seed_results,
+            }, f, indent=2)
 
 
 def stage7_branch(args, cfg: Dict[str, Any]) -> None:
@@ -868,7 +1218,7 @@ def main():
     ap.add_argument('--storage', type=str, default='sqlite:///experiments/optuna/trunk_global.db')
     ap.add_argument('--output-root', type=str, default='experiments/trunk_hpo')
     ap.add_argument('--stage', type=str, required=True,
-                    choices=['stage0', 'stage1', 'stage2', 'stage3', 'stage3_prime', 'stage3_single', 'stage4', 'stage5', 'stage6', 'stage7'])
+                    choices=['stage0', 'stage1', 'stage2', 'stage3', 'stage3_prime', 'stage3_single', 'stage4', 'stage5', 'stage6', 'stage6_eval_topk', 'stage7'])
     ap.add_argument('--n-trials', type=int, default=36)
     ap.add_argument('--epochs', type=int, default=12)
     ap.add_argument('--limit-files', type=int, default=200)
@@ -879,6 +1229,12 @@ def main():
     ap.add_argument('--split-ids', nargs='*', default=None, help='OOD split ids for stage4')
     ap.add_argument('--epoch-split', type=str, default='all', choices=['short', 'mid', 'long', 'all'],
                     help='Stage5 epoch split: short={60,75}, mid={90,180}, long={105,120,150}, all=full')
+    ap.add_argument('--stage6-ood-eval-mode', type=str, default='lite', choices=['lite', 'full'],
+                    help='Stage6 OOD eval mode: lite uses fixed subset, full uses all')
+    ap.add_argument('--stage6-ood-lite-count', type=int, default=64,
+                    help='Stage6 lite OOD sample count (fixed subset size)')
+    ap.add_argument('--stage6-topk', type=int, default=3,
+                    help='Stage6 top-k to re-evaluate in stage6_eval_topk')
     args = ap.parse_args()
 
     args.timeout_seconds = int(args.timeout_hours * 3600)
@@ -932,10 +1288,18 @@ def main():
         args.batch_size = 8
         stage5_epoch_tune(args, cfg)
     elif args.stage == 'stage6':
+        if args.n_trials == 36:
+            args.n_trials = 24
+        args.epochs = 180
         args.limit_files = None
         args.pts_per_map = 8192
         args.batch_size = 8
         stage6_physics(args, cfg)
+    elif args.stage == 'stage6_eval_topk':
+        args.limit_files = None
+        args.pts_per_map = 8192
+        args.batch_size = 8
+        stage6_eval_topk(args, cfg)
     elif args.stage == 'stage7':
         args.limit_files = None
         args.pts_per_map = 8192
