@@ -817,6 +817,16 @@ def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         'seed': 42,
         'grace_epochs': epochs + 1,
         'patience': epochs + 1,
+        'save_best_ckpt': True,
+        'save_periodic_ckpt': False,
+        'save_debug_figures': False,
+        'save_final_ckpt': False,
+        'mlflow_artifacts': False,
+        'save_best_ckpt_mode': 'deferred',
+        'val_every_epochs': args.stage6_val_every_epochs,
+        'highfreq_every_epochs': args.stage6_highfreq_every_epochs,
+        'val_limit_files': args.stage6_val_limit_files,
+        'compute_highfreq': args.stage6_compute_highfreq,
     }
     meta = {
         'epochs': epochs,
@@ -859,21 +869,13 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
     ood_lite_count = min(ood_lite_count, len(val_ds_full))
     ood_lite_indices = set(range(ood_lite_count))
 
-    def eval_iid_ood_metrics(model_path: Path, overrides: Dict[str, Any]) -> Dict[str, Any]:
+    def eval_iid_ood_metrics(eval_model: torch.nn.Module, outdir: Path) -> Dict[str, Any]:
         norm_cfg = build_norm_cfg(cfg)
         tl_min = norm_cfg['tl_db']['min']
         tl_max = norm_cfg['tl_db']['max']
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model = build_model(cfg, overrides).to(device)
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        elif 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        model.eval()
+        eval_model.eval()
+        device = next(eval_model.parameters()).device
 
         results = {'IID': [], 'OOD_range_70_30': [], 'OOD_range_far': []}
         with torch.no_grad():
@@ -882,7 +884,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
                 cond = batch['cond'].to(device)
                 tl_gt_norm = batch['tl'].cpu().squeeze()
 
-                tl_pred_norm = infer_full_map(model, ray, cond, device=device)
+                tl_pred_norm = infer_full_map(eval_model, ray, cond, device=device)
 
                 H, W = tl_gt_norm.shape
                 r_coords = torch.linspace(0, 1, W)
@@ -931,7 +933,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         delta_far = (ood_far - iid_fullgrid) if (ood_far is not None and iid_fullgrid is not None) else None
 
         return {
-            'model_path': str(model_path),
+            'model_path': str(outdir / 'final.pt'),
             'n_samples': len(results['IID']),
             'ood_samples': len(results['OOD_range_70_30']),
             'ood_eval_mode': ood_eval_mode,
@@ -982,9 +984,11 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         })
 
         res = fit_one_trial(cfg, overrides=overrides, trial=trial,
-                            force_no_physics=False, force_amp=True, enable_gate=False)
-        model_path = Path(overrides['outdir']) / 'best.pt'
-        metrics = eval_iid_ood_metrics(model_path, overrides)
+                            force_no_physics=False, force_amp=True, enable_gate=False, return_model=True)
+        eval_model = res.pop('eval_model', None)
+        if eval_model is None:
+            return float('inf')
+        metrics = eval_iid_ood_metrics(eval_model, Path(overrides['outdir']))
         obj = compute_objective(metrics)
 
         trial_summary = {
@@ -1006,6 +1010,10 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
 
         trial.set_user_attr('metrics', metrics)
         trial.set_user_attr('objective', obj)
+        if eval_model is not None:
+            del eval_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return obj
 
     study.optimize(objective, n_trials=args.n_trials, timeout=None, gc_after_trial=True)
@@ -1163,6 +1171,8 @@ def stage6_eval_topk(args, cfg: Dict[str, Any]) -> None:
             res = fit_one_trial(cfg, overrides=overrides, trial=None,
                                 force_no_physics=False, force_amp=True, enable_gate=False)
             model_path = Path(overrides['outdir']) / 'best.pt'
+            if not model_path.exists():
+                raise FileNotFoundError(f"Missing best.pt at {model_path}")
             metrics = eval_full_ood(model_path, overrides)
             metrics['seed'] = seed
             metrics['fit_result'] = res
@@ -1233,6 +1243,14 @@ def main():
                     help='Stage6 OOD eval mode: lite uses fixed subset, full uses all')
     ap.add_argument('--stage6-ood-lite-count', type=int, default=64,
                     help='Stage6 lite OOD sample count (fixed subset size)')
+    ap.add_argument('--stage6-val-every-epochs', type=int, default=5,
+                    help='Stage6 validation frequency (epochs)')
+    ap.add_argument('--stage6-highfreq-every-epochs', type=int, default=10,
+                    help='Stage6 highfreq metric frequency (epochs)')
+    ap.add_argument('--stage6-val-limit-files', type=int, default=64,
+                    help='Stage6 val limit files (fixed leading subset)')
+    ap.add_argument('--stage6-compute-highfreq', action='store_true',
+                    help='Stage6 compute highfreq metric during val')
     ap.add_argument('--stage6-topk', type=int, default=3,
                     help='Stage6 top-k to re-evaluate in stage6_eval_topk')
     args = ap.parse_args()

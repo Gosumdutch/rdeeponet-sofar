@@ -386,7 +386,11 @@ def make_scheduler(cfg: Dict[str, Any], optimizer, epochs: int, steps_per_epoch:
     return build_scheduler(optimizer, scfg, epochs)
 
 
-def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_min: float, tl_max: float) -> Tuple[float, float, float, float]:
+def compute_zone_mae(tl_pred_norm: torch.Tensor,
+                     tl_gt_norm: torch.Tensor,
+                     tl_min: float,
+                     tl_max: float,
+                     compute_highfreq: bool = True) -> Tuple[float, float, float, float]:
     """
     Compute overall, mid-range, caustic, and highfreq MAE (dB).
     mid-range: r in [0.33, 0.66]; caustic: high-grad mask (top 20%); highfreq: top 10% grad.
@@ -420,11 +424,12 @@ def compute_zone_mae(tl_pred_norm: torch.Tensor, tl_gt_norm: torch.Tensor, tl_mi
         mask_caustic = grad_mag > thr_caustic
         if mask_caustic.any():
             caustic = mae_db_from_norm(tl_pred_norm[mask_caustic], tl_gt_norm[mask_caustic], tl_min, tl_max).item()
-        # highfreq: top 10% gradient (stricter)
-        thr_highfreq = torch.quantile(grad_mag.flatten(), 0.9)
-        mask_highfreq = grad_mag > thr_highfreq
-        if mask_highfreq.any():
-            highfreq = mae_db_from_norm(tl_pred_norm[mask_highfreq], tl_gt_norm[mask_highfreq], tl_min, tl_max).item()
+        if compute_highfreq:
+            # highfreq: top 10% gradient (stricter)
+            thr_highfreq = torch.quantile(grad_mag.flatten(), 0.9)
+            mask_highfreq = grad_mag > thr_highfreq
+            if mask_highfreq.any():
+                highfreq = mae_db_from_norm(tl_pred_norm[mask_highfreq], tl_gt_norm[mask_highfreq], tl_min, tl_max).item()
     return float(overall), float(mid), float(caustic), float(highfreq)
 
 
@@ -433,7 +438,8 @@ def evaluate_mae_zones(model: nn.Module,
                        tl_min: float, tl_max: float,
                        device: torch.device,
                        max_batches: Optional[int] = None,
-                       check_consistency: bool = False) -> Tuple[float, float, float, float, Optional[float]]:
+                       check_consistency: bool = False,
+                       compute_highfreq: bool = True) -> Tuple[float, float, float, float, Optional[float]]:
     model.eval()
     overall_list = []
     mid_list = []
@@ -449,7 +455,9 @@ def evaluate_mae_zones(model: nn.Module,
             tl_gt_norm = batch['tl'].cpu()
             tl_pred_norm = infer_full_map(model, ray, cond, device=device, consistency=consistency_stats)
             tl_pred_norm = tl_pred_norm.unsqueeze(0).unsqueeze(0)
-            overall, mid, caustic, highfreq = compute_zone_mae(tl_pred_norm, tl_gt_norm, tl_min, tl_max)
+            overall, mid, caustic, highfreq = compute_zone_mae(
+                tl_pred_norm, tl_gt_norm, tl_min, tl_max, compute_highfreq=compute_highfreq
+            )
             overall_list.append(overall)
             mid_list.append(mid)
             caustic_list.append(caustic)
@@ -473,9 +481,14 @@ def fit_one_trial(cfg: Dict[str, Any],
                   patience: int = 30,
                   force_no_physics: bool = False,
                   force_amp: bool = False,
-                  enable_gate: bool = True) -> Dict[str, Any]:
+                  enable_gate: bool = True,
+                  return_model: bool = False) -> Dict[str, Any]:
     train_cfg = cfg['training']
     eval_cfg = cfg.get('evaluation', {})
+    val_every_epochs = int((overrides or {}).get('val_every_epochs', eval_cfg.get('val_every_epochs', 1)))
+    highfreq_every_epochs = int((overrides or {}).get('highfreq_every_epochs', eval_cfg.get('highfreq_every_epochs', 1)))
+    compute_highfreq_flag = bool((overrides or {}).get('compute_highfreq', eval_cfg.get('compute_highfreq', True)))
+    val_limit_files = (overrides or {}).get('val_limit_files', eval_cfg.get('val_limit_files'))
 
     seed_value = int((overrides or {}).get('seed', cfg.get('seed', 42)))
     random.seed(seed_value)
@@ -577,6 +590,23 @@ def fit_one_trial(cfg: Dict[str, Any],
     smooth_weight = float(loss_weights.get('smooth', loss_weights.get('grad', 0.0)))
     tv_weight = float(loss_weights.get('tv', 0.0))
 
+    save_best_ckpt = bool((overrides or {}).get('save_best_ckpt', train_cfg.get('save_best_ckpt', True)))
+    save_periodic_ckpt = bool((overrides or {}).get('save_periodic_ckpt', train_cfg.get('save_periodic_ckpt', True)))
+    save_debug = bool((overrides or {}).get('save_debug_figures', train_cfg.get('save_debug_figures', True)))
+    save_final_ckpt = bool((overrides or {}).get('save_final_ckpt', train_cfg.get('save_final_ckpt', False)))
+    mlflow_artifacts = bool((overrides or {}).get('mlflow_artifacts', train_cfg.get('mlflow_artifacts', True)))
+    save_best_ckpt_mode = str((overrides or {}).get('save_best_ckpt_mode', train_cfg.get('save_best_ckpt_mode', 'immediate'))).lower()
+
+    # Backward compatibility for older flag names
+    if overrides and 'save_best' in overrides and 'save_best_ckpt' not in overrides:
+        save_best_ckpt = bool(overrides['save_best'])
+    if overrides and 'save_checkpoints' in overrides and 'save_periodic_ckpt' not in overrides:
+        save_periodic_ckpt = bool(overrides['save_checkpoints'])
+    if 'save_best' in train_cfg and 'save_best_ckpt' not in train_cfg:
+        save_best_ckpt = bool(train_cfg.get('save_best', save_best_ckpt))
+    if 'save_checkpoints' in train_cfg and 'save_periodic_ckpt' not in train_cfg:
+        save_periodic_ckpt = bool(train_cfg.get('save_checkpoints', save_periodic_ckpt))
+
     if overrides and 'loss_reciprocity_weight' in overrides:
         reciprocity_weight = float(overrides['loss_reciprocity_weight'])
     if overrides and 'loss_smooth_weight' in overrides:
@@ -649,10 +679,21 @@ def fit_one_trial(cfg: Dict[str, Any],
 
     best_mae = float('inf')
     best_mae_percent = float('inf')
+    best_state_dict = None
+    best_ema_state_dict = None
+    best_epoch = None
     metrics_rows: list[Dict[str, Any]] = []
     step_count = 0
     epochs_since_improve = 0
     gate_baseline_loss = None
+    last_val_overall = None
+    last_val_mid = None
+    last_val_caustic = None
+    last_val_highfreq = None
+    last_consistency_diff = None
+
+    def _clone_state_dict(state_dict):
+        return {k: v.detach().cpu().clone() for k, v in state_dict.items()}
 
     # Enhanced logging setup
     training_log_path = outdir / 'training_log.jsonl'
@@ -799,27 +840,47 @@ def fit_one_trial(cfg: Dict[str, Any],
         if not isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
             scheduler.step()
 
-        eval_model = ema_model if ema_model is not None else model
-        if ema_model is not None:
-            eval_model.eval()
-        eval_subset = (overrides or {}).get('eval_subset')
-        max_batches = None
-        if eval_subset is not None and len(val_loader_full.dataset) > 0:
-            bs = val_loader_full.batch_size or 1
-            max_batches = max(1, int(eval_subset) // bs)
-        val_overall, val_mid, val_caustic, val_highfreq, consistency_diff = evaluate_mae_zones(
-            eval_model,
-            val_loader_full,
-            tl_min,
-            tl_max,
-            device,
-            max_batches=max_batches,
-            check_consistency=bool(eval_cfg.get('check_consistency', False))
+        do_eval = ((epoch + 1) % max(1, val_every_epochs) == 0) or (epoch + 1 == epochs)
+        compute_highfreq = compute_highfreq_flag and (
+            ((epoch + 1) % max(1, highfreq_every_epochs) == 0) or (epoch + 1 == epochs)
         )
-        if not torch.isfinite(torch.tensor(val_overall)).all() or val_overall > 100.0:
-            print(f"Warning: Invalid validation MAE at epoch {epoch}: {val_overall}")
-            if trial is not None:
-                return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf')}
+        if do_eval:
+            eval_model = ema_model if ema_model is not None else model
+            if ema_model is not None:
+                eval_model.eval()
+            eval_subset = (overrides or {}).get('eval_subset')
+            max_batches = None
+            if eval_subset is not None and len(val_loader_full.dataset) > 0:
+                bs = val_loader_full.batch_size or 1
+                max_batches = max(1, int(eval_subset) // bs)
+            if val_limit_files is not None:
+                limit_files = max(1, int(val_limit_files))
+                max_batches = limit_files if max_batches is None else min(max_batches, limit_files)
+            val_overall, val_mid, val_caustic, val_highfreq, consistency_diff = evaluate_mae_zones(
+                eval_model,
+                val_loader_full,
+                tl_min,
+                tl_max,
+                device,
+                max_batches=max_batches,
+                check_consistency=bool(eval_cfg.get('check_consistency', False)),
+                compute_highfreq=compute_highfreq
+            )
+            if not torch.isfinite(torch.tensor(val_overall)).all() or val_overall > 100.0:
+                print(f"Warning: Invalid validation MAE at epoch {epoch}: {val_overall}")
+                if trial is not None:
+                    return {'best_mae_db': float('inf'), 'best_mae_percent': float('inf')}
+            last_val_overall = val_overall
+            last_val_mid = val_mid
+            last_val_caustic = val_caustic
+            last_val_highfreq = val_highfreq
+            last_consistency_diff = consistency_diff
+        else:
+            val_overall = last_val_overall if last_val_overall is not None else best_mae
+            val_mid = last_val_mid if last_val_mid is not None else val_overall
+            val_caustic = last_val_caustic if last_val_caustic is not None else val_overall
+            val_highfreq = last_val_highfreq if last_val_highfreq is not None else val_overall
+            consistency_diff = last_consistency_diff
 
         avg_train_loss = running_loss / max(1, batches)
         avg_train_mae_db = (running_mae_norm / max(1, batches)) * (tl_max - tl_min)
@@ -840,11 +901,11 @@ def fit_one_trial(cfg: Dict[str, Any],
         # Get scheduler info
         eta_min_ratio = getattr(scheduler, 'eta_min_ratio', None) if hasattr(scheduler, 'eta_min_ratio') else None
 
-        if mlflow is not None:
+        if mlflow is not None and mlflow_artifacts:
             try:
                 mlflow.log_metric('train_loss', float(avg_train_loss), step=epoch)
                 mlflow.log_metric('train_mae_db', float(avg_train_mae_db), step=epoch)
-                mlflow.log_metric('val_mae_db', float(val_mae), step=epoch)
+                mlflow.log_metric('val_mae_db', float(val_overall), step=epoch)
                 if reciprocity_weight > 0.0 or loss_composer.should_compute_reciprocity(epoch):
                     mlflow.log_metric('train_recip_loss', float(avg_recip_loss), step=epoch)
                     mlflow.log_metric('recip_valid_ratio', float(avg_recip_valid_ratio), step=epoch)
@@ -905,28 +966,35 @@ def fit_one_trial(cfg: Dict[str, Any],
         if improved:
             best_mae = val_overall
             best_mae_percent = (val_overall / db_range) * 100.0
-            checkpoint = {
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
-                'best_mae_db': best_mae,
-                'best_mae_percent': best_mae_percent,
-                'config': cfg,
-                'scaler': scaler.state_dict(),
-            }
-            if ema_model is not None:
-                checkpoint['ema_state_dict'] = ema_model.state_dict()
-            torch.save(checkpoint, outdir / 'best.pt')
-            try:
-                first_val_batch = next(iter(val_loader_full))
-                save_debug_figures(eval_model, first_val_batch, outdir, device, tl_min, tl_max)
-            except Exception:
-                pass
+            best_epoch = epoch + 1
+            if save_best_ckpt_mode == 'deferred' or return_model:
+                best_state_dict = _clone_state_dict(model.state_dict())
+                if ema_model is not None:
+                    best_ema_state_dict = _clone_state_dict(ema_model.state_dict())
+            if save_best_ckpt and save_best_ckpt_mode == 'immediate':
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
+                    'best_mae_db': best_mae,
+                    'best_mae_percent': best_mae_percent,
+                    'config': cfg,
+                    'scaler': scaler.state_dict(),
+                }
+                if ema_model is not None:
+                    checkpoint['ema_state_dict'] = ema_model.state_dict()
+                torch.save(checkpoint, outdir / 'best.pt')
+                if save_debug:
+                    try:
+                        first_val_batch = next(iter(val_loader_full))
+                        save_debug_figures(eval_model, first_val_batch, outdir, device, tl_min, tl_max)
+                    except Exception:
+                        pass
             epochs_since_improve = 0
 
         # Save periodic checkpoint every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        if save_periodic_ckpt and (epoch + 1) % 10 == 0:
             periodic_checkpoint = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
@@ -944,7 +1012,7 @@ def fit_one_trial(cfg: Dict[str, Any],
 
         if trial is not None:
             try:
-                trial.report(val_mae, step=epoch)
+                trial.report(val_overall, step=epoch)
                 if epoch + 1 >= grace_epochs and (epoch + 1) % max(1, prune_interval) == 0 and trial.should_prune():
                     if optuna is not None:
                         raise optuna.TrialPruned()
@@ -975,8 +1043,58 @@ def fit_one_trial(cfg: Dict[str, Any],
     except Exception:
         pass
 
-    return {'best_mae_db': best_mae, 'best_mae_percent': best_mae_percent, 'final_epoch': final_epoch,
-            'val_mae_mid_db': val_mid, 'val_mae_caustic_db': val_caustic, 'val_mae_highfreq_db': val_highfreq}
+    if save_best_ckpt and save_best_ckpt_mode == 'deferred':
+        if best_state_dict is None:
+            best_state_dict = _clone_state_dict(model.state_dict())
+            if ema_model is not None:
+                best_ema_state_dict = _clone_state_dict(ema_model.state_dict())
+            best_epoch = final_epoch
+        best_checkpoint = {
+            'epoch': best_epoch if best_epoch is not None else final_epoch,
+            'state_dict': best_state_dict,
+            'best_mae_db': best_mae,
+            'best_mae_percent': best_mae_percent,
+            'config': cfg,
+        }
+        if best_ema_state_dict is not None:
+            best_checkpoint['ema_state_dict'] = best_ema_state_dict
+        torch.save(best_checkpoint, outdir / 'best.pt')
+
+    if save_final_ckpt:
+        final_checkpoint = {
+            'epoch': final_epoch,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict() if hasattr(scheduler, 'state_dict') else None,
+            'best_mae_db': best_mae,
+            'best_mae_percent': best_mae_percent,
+            'scaler': scaler.state_dict(),
+        }
+        if ema_model is not None:
+            final_checkpoint['ema_state_dict'] = ema_model.state_dict()
+        torch.save(final_checkpoint, outdir / 'final.pt')
+
+    result = {
+        'best_mae_db': best_mae,
+        'best_mae_percent': best_mae_percent,
+        'final_epoch': final_epoch,
+        'val_mae_mid_db': val_mid,
+        'val_mae_caustic_db': val_caustic,
+        'val_mae_highfreq_db': val_highfreq,
+    }
+    if return_model:
+        if best_ema_state_dict is not None and ema_model is not None:
+            ema_model.load_state_dict(best_ema_state_dict)
+            eval_model = ema_model
+        elif best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            eval_model = model
+        else:
+            eval_model = ema_model if ema_model is not None else model
+        eval_model.eval()
+        result['eval_model'] = eval_model
+        result['device'] = device
+    return result
 
 def main():
     parser = argparse.ArgumentParser()
