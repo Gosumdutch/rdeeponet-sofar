@@ -827,6 +827,7 @@ def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         'highfreq_every_epochs': args.stage6_highfreq_every_epochs,
         'val_limit_files': args.stage6_val_limit_files,
         'compute_highfreq': args.stage6_compute_highfreq,
+        'tv_batch_limit': 2,
     }
     meta = {
         'epochs': epochs,

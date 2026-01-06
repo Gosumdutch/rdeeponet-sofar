@@ -596,6 +596,9 @@ def fit_one_trial(cfg: Dict[str, Any],
     save_final_ckpt = bool((overrides or {}).get('save_final_ckpt', train_cfg.get('save_final_ckpt', False)))
     mlflow_artifacts = bool((overrides or {}).get('mlflow_artifacts', train_cfg.get('mlflow_artifacts', True)))
     save_best_ckpt_mode = str((overrides or {}).get('save_best_ckpt_mode', train_cfg.get('save_best_ckpt_mode', 'immediate'))).lower()
+    tv_batch_limit = (overrides or {}).get('tv_batch_limit', train_cfg.get('tv_batch_limit'))
+    if tv_batch_limit is not None:
+        tv_batch_limit = int(tv_batch_limit)
 
     # Backward compatibility for older flag names
     if overrides and 'save_best' in overrides and 'save_best_ckpt' not in overrides:
@@ -765,11 +768,16 @@ def fit_one_trial(cfg: Dict[str, Any],
 
                 # TV loss (backward compatibility - uses full grid, expensive)
                 if tv_weight > 0.0:
-                    full_pred = model.forward_full(ray, cond)
+                    ray_tv = ray
+                    cond_tv = cond
+                    if tv_batch_limit is not None and tv_batch_limit > 0 and ray.size(0) > tv_batch_limit:
+                        ray_tv = ray[:tv_batch_limit]
+                        cond_tv = cond[:tv_batch_limit]
+                    full_pred = model.forward_full(ray_tv, cond_tv)
                     if full_pred.dim() == 2:
                         full_pred = full_pred.unsqueeze(0)
-                    elif full_pred.dim() == 3 and full_pred.size(0) != ray.size(0):
-                        full_pred = full_pred.view(ray.size(0), ray.shape[-2], ray.shape[-1])
+                    elif full_pred.dim() == 3 and full_pred.size(0) != ray_tv.size(0):
+                        full_pred = full_pred.view(ray_tv.size(0), ray_tv.shape[-2], ray_tv.shape[-1])
                     diff_x = full_pred[:, :, 1:] - full_pred[:, :, :-1]
                     diff_y = full_pred[:, 1:, :] - full_pred[:, :-1, :]
                     tv_term = diff_x.abs().mean() + diff_y.abs().mean()
