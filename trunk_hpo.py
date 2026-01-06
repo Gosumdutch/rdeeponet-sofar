@@ -986,6 +986,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         res = fit_one_trial(cfg, overrides=overrides, trial=trial,
                             force_no_physics=False, force_amp=True, enable_gate=False, return_model=True)
         eval_model = res.pop('eval_model', None)
+        res.pop('device', None)
         if eval_model is None:
             return float('inf')
         metrics = eval_iid_ood_metrics(eval_model, Path(overrides['outdir']))
@@ -1006,7 +1007,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
             'fit_result': res,
         }
         with open(Path(overrides['outdir']) / 'stage6_trial_summary.json', 'w') as f:
-            json.dump(trial_summary, f, indent=2)
+            json.dump(trial_summary, f, indent=2, default=str)
 
         trial.set_user_attr('metrics', metrics)
         trial.set_user_attr('objective', obj)
