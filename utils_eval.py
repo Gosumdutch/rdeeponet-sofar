@@ -43,9 +43,11 @@ def infer_full_map(model: nn.Module,
                    device: Optional[torch.device] = None,
                    H: int = 256,
                    W: int = 256,
-                   consistency: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+                   consistency: Optional[Dict[str, Any]] = None,
+                   require_forward_full: bool = False) -> torch.Tensor:
     """Full-map inference helper returning normalized TL in [0,1].
     Tries model.forward_full first; if unavailable, falls back to forward_coord over a full grid.
+    If require_forward_full is True, raises when forward_full is unavailable or fails.
 
     Inputs:
       - ray: [1,1,H,W] or [B,1,H,W] (first item used)
@@ -104,8 +106,15 @@ def infer_full_map(model: nn.Module,
                 tl_map_full = out.detach().cpu().clamp(0.0, 1.0)
             elif out.dim() == 3:
                 tl_map_full = out[0].detach().cpu().clamp(0.0, 1.0)
-        except Exception:
+        except Exception as exc:
+            if require_forward_full:
+                raise RuntimeError("infer_full_map: forward_full failed") from exc
             tl_map_full = None
+
+    if require_forward_full:
+        if tl_map_full is None:
+            raise RuntimeError("infer_full_map: forward_full required but unavailable")
+        return tl_map_full
 
     if tl_map_full is not None and consistency is None:
         return tl_map_full

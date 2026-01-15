@@ -795,6 +795,7 @@ def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     fourier_dims = split_dim(dim_total, sigma_list, ratio=ratio)
     epochs = 180
     warmup_epochs = max(1, int(epochs * 0.05))
+    physics_warmup_epochs = 80
 
     fixed_overrides = {
         'trunk_type': 'ff',
@@ -817,6 +818,11 @@ def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         'seed': 42,
         'grace_epochs': epochs + 1,
         'patience': epochs + 1,
+        'loss_type': 'huber',
+        'loss_reciprocity_weight': 0.0,
+        'loss_smooth_weight': 0.0,
+        'loss_tv_weight': 0.0,
+        'physics_warmup_epochs': physics_warmup_epochs,
         'save_best_ckpt': True,
         'save_periodic_ckpt': False,
         'save_debug_figures': False,
@@ -840,8 +846,62 @@ def build_stage6_fixed_overrides(args) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         'dim_ratio': '70_30',
         'depth': 7,
         'cond_mode': 'concat',
+        'physics_warmup_epochs': physics_warmup_epochs,
+        'loss_reciprocity_weight': 0.0,
+        'loss_tv_weight': 0.0,
+        'loss_smooth_weight_range': [1e-7, 1e-5],
+        'loss_tv_weight_range': [1e-7, 1e-5],
+        'loss_reciprocity_weight_range': [1e-5, 1e-2],
+        'huber_delta_range': [0.5, 1.2],
+        'stage6_reg_mode': args.stage6_reg_mode,
     }
     return fixed_overrides, meta
+
+
+def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
+    backend = args.stage6_autosampler_backend
+    seed = 42
+
+    if backend in ('auto', 'optunahub'):
+        try:
+            import optunahub
+            if hasattr(optunahub, 'load'):
+                import inspect
+                candidates = ['samplers/auto', 'samplers/AutoSampler', 'samplers/auto_sampler']
+                for ref in candidates:
+                    try:
+                        sampler_obj = optunahub.load(ref)
+                    except Exception:
+                        continue
+                    sampler = sampler_obj
+                    if isinstance(sampler, type):
+                        try:
+                            if 'seed' in inspect.signature(sampler).parameters:
+                                sampler = sampler(seed=seed)
+                            else:
+                                sampler = sampler()
+                        except Exception:
+                            sampler = sampler()
+                    if hasattr(sampler, 'seed'):
+                        sampler.seed = seed
+                    return sampler
+        except Exception:
+            if backend == 'optunahub':
+                raise
+
+    if backend in ('auto', 'optuna'):
+        auto_sampler_cls = getattr(optuna.samplers, 'AutoSampler', None)
+        if auto_sampler_cls is None:
+            raise RuntimeError("AutoSampler not available. Please upgrade optuna to >= 4.6.")
+        try:
+            import inspect
+            if 'seed' in inspect.signature(auto_sampler_cls).parameters:
+                return auto_sampler_cls(seed=seed)
+        except Exception:
+            pass
+        return auto_sampler_cls()
+
+    raise ValueError(f"Unknown stage6 autosampler backend: {backend}")
 
 
 def stage6_physics(args, cfg: Dict[str, Any]) -> None:
@@ -853,7 +913,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
     stage_root = ensure_dir(Path(args.output_root) / args.study / 'stage6_physics')
     study_name = f"{args.study}_stage6_physics"
 
-    sampler = TPESampler(seed=42, multivariate=True, n_startup_trials=6)
+    sampler = build_stage6_sampler(args)
     pruner = SuccessiveHalvingPruner(min_resource=10, reduction_factor=3, min_early_stopping_rate=0)
     study = optuna.create_study(study_name=study_name, storage=args.storage.replace('.db', '_stage6.db'),
                                 load_if_exists=True, sampler=sampler, pruner=pruner, direction='minimize')
@@ -861,6 +921,7 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
     fixed_overrides, fixed_meta = build_stage6_fixed_overrides(args)
     ood_eval_mode = args.stage6_ood_eval_mode
     ood_lite_count = max(1, int(args.stage6_ood_lite_count))
+    reg_mode = args.stage6_reg_mode
 
     split_ratio = {'train': 0.8, 'val': 0.2}
     eval_overrides = dict(fixed_overrides)
@@ -874,6 +935,17 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         norm_cfg = build_norm_cfg(cfg)
         tl_min = norm_cfg['tl_db']['min']
         tl_max = norm_cfg['tl_db']['max']
+        iid_limit = args.stage6_val_limit_files
+        if iid_limit is not None:
+            iid_limit = int(iid_limit)
+            if iid_limit <= 0:
+                iid_limit = None
+        max_needed_idx = None
+        if iid_limit is not None:
+            max_needed_idx = iid_limit - 1
+        if ood_eval_mode == 'lite':
+            base_idx = max_needed_idx if max_needed_idx is not None else -1
+            max_needed_idx = max(base_idx, ood_lite_count - 1)
 
         eval_model.eval()
         device = next(eval_model.parameters()).device
@@ -881,11 +953,17 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         results = {'IID': [], 'OOD_range_70_30': [], 'OOD_range_far': []}
         with torch.no_grad():
             for idx, batch in enumerate(val_loader):
+                if max_needed_idx is not None and idx > max_needed_idx:
+                    break
+                need_iid = iid_limit is None or idx < iid_limit
+                need_ood = (ood_eval_mode == 'full' or idx in ood_lite_indices)
+                if not (need_iid or need_ood):
+                    continue
                 ray = batch['ray'].to(device)
                 cond = batch['cond'].to(device)
                 tl_gt_norm = batch['tl'].cpu().squeeze()
 
-                tl_pred_norm = infer_full_map(eval_model, ray, cond, device=device)
+                tl_pred_norm = infer_full_map(eval_model, ray, cond, device=device, require_forward_full=True)
 
                 H, W = tl_gt_norm.shape
                 r_coords = torch.linspace(0, 1, W)
@@ -901,24 +979,22 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
                     gt_zone = gt[mask_2d]
                     return mae_db_from_norm(pred_zone, gt_zone, tl_min, tl_max).item()
 
-                iid_mae = zone_mae(tl_pred_norm, tl_gt_norm, iid_mask)
-                ood_mae = None
-                far_mae = None
-                if ood_eval_mode == 'full' or idx in ood_lite_indices:
+                if need_iid:
+                    iid_mae = zone_mae(tl_pred_norm, tl_gt_norm, iid_mask)
+                    overall, mid, caustic, highfreq = compute_zone_mae(
+                        tl_pred_norm.unsqueeze(0).unsqueeze(0),
+                        tl_gt_norm.unsqueeze(0).unsqueeze(0),
+                        tl_min, tl_max
+                    )
+                    results['IID'].append({'mae': iid_mae, 'overall': overall, 'mid': mid,
+                                           'caustic': caustic, 'highfreq': highfreq})
+                if need_ood:
                     ood_mae = zone_mae(tl_pred_norm, tl_gt_norm, ood_mask)
                     far_mae = zone_mae(tl_pred_norm, tl_gt_norm, far_mask)
-
-                overall, mid, caustic, highfreq = compute_zone_mae(
-                    tl_pred_norm.unsqueeze(0).unsqueeze(0),
-                    tl_gt_norm.unsqueeze(0).unsqueeze(0),
-                    tl_min, tl_max
-                )
-                results['IID'].append({'mae': iid_mae, 'overall': overall, 'mid': mid,
-                                       'caustic': caustic, 'highfreq': highfreq})
-                if ood_mae is not None:
-                    results['OOD_range_70_30'].append({'mae': ood_mae})
-                if far_mae is not None:
-                    results['OOD_range_far'].append({'mae': far_mae})
+                    if ood_mae is not None:
+                        results['OOD_range_70_30'].append({'mae': ood_mae})
+                    if far_mae is not None:
+                        results['OOD_range_far'].append({'mae': far_mae})
 
         def avg(lst, key='mae'):
             vals = [x[key] for x in lst if x.get(key) is not None]
@@ -947,41 +1023,53 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
             'OOD_range_far': ood_far,
             'delta_70_30': delta_70_30,
             'delta_far': delta_far,
+            'mae_full': iid_fullgrid,
+            'mae_shadow': ood_70_30,
+            'mae_far': ood_far,
         }
 
     def compute_objective(metrics: Dict[str, Any]) -> float:
-        mae_iid = metrics.get('IID_fullgrid')
-        mae_highfreq = metrics.get('IID_highfreq')
-        delta_70_30 = metrics.get('delta_70_30')
-        delta_far = metrics.get('delta_far')
-        if None in (mae_iid, mae_highfreq, delta_70_30, delta_far):
+        mae_full = metrics.get('IID_fullgrid')
+        mae_shadow = metrics.get('OOD_range_70_30')
+        mae_far = metrics.get('OOD_range_far')
+        if None in (mae_full, mae_shadow, mae_far):
             return float('inf')
-        highfreq_pen = max(0.0, float(mae_highfreq) - float(mae_iid) - 0.12)
-        ood_70_pen = max(0.0, float(delta_70_30) - 0.08)
-        ood_far_pen = max(0.0, float(delta_far) - 0.25)
-        return float(mae_iid) + 2.0 * highfreq_pen + 1.0 * ood_70_pen + 0.5 * ood_far_pen
+        return (float(mae_full) + float(mae_shadow) + float(mae_far)) / 3.0
 
     def objective(trial: optuna.Trial):
-        reg_type = trial.suggest_categorical('reg_type', ['none', 'grad', 'tv'])
-        huber_delta = trial.suggest_categorical('huber_delta', [0.5, 1.0, 1.5])
-        physics_warmup_epochs = trial.suggest_categorical('physics_warmup_epochs', [60, 80, 100])
-        lambda_rec = trial.suggest_loguniform('loss_reciprocity_weight', 1e-5, 1e-2)
+        huber_delta = trial.suggest_float('huber_delta', 0.5, 1.2)
         lambda_grad = 0.0
         lambda_tv = 0.0
-        if reg_type == 'grad':
-            lambda_grad = trial.suggest_loguniform('loss_smooth_weight', 1e-7, 1e-4)
-        elif reg_type == 'tv':
-            lambda_tv = trial.suggest_loguniform('loss_tv_weight', 1e-7, 1e-5)
+        lambda_rec = 0.0
+        reg_type = reg_mode
+
+        if reg_mode == 'grad':
+            lambda_grad = trial.suggest_float('loss_smooth_weight', 1e-7, 1e-5, log=True)
+        elif reg_mode == 'tv':
+            lambda_tv = trial.suggest_float('loss_tv_weight', 1e-7, 1e-5, log=True)
+        elif reg_mode == 'grad_tv':
+            lambda_grad = trial.suggest_float('loss_smooth_weight', 1e-7, 1e-5, log=True)
+            lambda_tv = trial.suggest_float('loss_tv_weight', 1e-7, 1e-5, log=True)
+        elif reg_mode == 'rec':
+            lambda_rec = trial.suggest_float('loss_reciprocity_weight', 1e-5, 1e-2, log=True)
+        elif reg_mode == 'auto':
+            reg_type = trial.suggest_categorical('reg_type', ['grad', 'tv', 'rec'])
+            if reg_type == 'grad':
+                lambda_grad = trial.suggest_float('loss_smooth_weight', 1e-7, 1e-5, log=True)
+            elif reg_type == 'tv':
+                lambda_tv = trial.suggest_float('loss_tv_weight', 1e-7, 1e-5, log=True)
+            else:
+                lambda_rec = trial.suggest_float('loss_reciprocity_weight', 1e-5, 1e-2, log=True)
+        else:
+            raise ValueError(f"Unknown stage6 reg mode: {reg_mode}")
 
         overrides = dict(fixed_overrides)
         overrides.update({
             'outdir': str(stage_root / f"trial_{trial.number:05d}"),
-            'loss_type': 'huber',
             'huber_delta': huber_delta,
             'loss_reciprocity_weight': lambda_rec,
             'loss_smooth_weight': lambda_grad,
             'loss_tv_weight': lambda_tv,
-            'physics_warmup_epochs': physics_warmup_epochs,
         })
 
         res = fit_one_trial(cfg, overrides=overrides, trial=trial,
@@ -999,11 +1087,11 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
             'params': {
                 'reg_type': reg_type,
                 'huber_delta': huber_delta,
-                'physics_warmup_epochs': physics_warmup_epochs,
                 'loss_reciprocity_weight': lambda_rec,
                 'loss_smooth_weight': lambda_grad,
                 'loss_tv_weight': lambda_tv,
             },
+            'fixed_params': fixed_meta,
             'metrics': metrics,
             'fit_result': res,
         }
@@ -1011,6 +1099,9 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
             json.dump(trial_summary, f, indent=2, default=str)
 
         trial.set_user_attr('metrics', metrics)
+        trial.set_user_attr('mae_full', metrics.get('mae_full'))
+        trial.set_user_attr('mae_shadow', metrics.get('mae_shadow'))
+        trial.set_user_attr('mae_far', metrics.get('mae_far'))
         trial.set_user_attr('objective', obj)
         if eval_model is not None:
             del eval_model
@@ -1028,6 +1119,9 @@ def stage6_physics(args, cfg: Dict[str, Any]) -> None:
         'fixed_params': fixed_meta,
         'ood_eval_mode': ood_eval_mode,
         'ood_lite_count': ood_lite_count,
+        'objective_def': 'mean(IID_fullgrid, OOD_range_70_30, OOD_range_far)',
+        'reg_mode': reg_mode,
+        'autosampler_backend': args.stage6_autosampler_backend,
         'topk': [
             {
                 'number': t.number,
@@ -1085,7 +1179,7 @@ def stage6_eval_topk(args, cfg: Dict[str, Any]) -> None:
                 cond = batch['cond'].to(device)
                 tl_gt_norm = batch['tl'].cpu().squeeze()
 
-                tl_pred_norm = infer_full_map(model, ray, cond, device=device)
+                tl_pred_norm = infer_full_map(model, ray, cond, device=device, require_forward_full=True)
 
                 H, W = tl_gt_norm.shape
                 r_coords = torch.linspace(0, 1, W)
@@ -1139,21 +1233,18 @@ def stage6_eval_topk(args, cfg: Dict[str, Any]) -> None:
             'OOD_range_far': ood_far,
             'delta_70_30': delta_70_30,
             'delta_far': delta_far,
+            'mae_full': iid_fullgrid,
+            'mae_shadow': ood_70_30,
+            'mae_far': ood_far,
         }
 
     top_root = ensure_dir(stage_root / 'topk_eval')
     for entry in topk:
         params = entry.get('params', {})
-        reg_type = params.get('reg_type', 'none')
         huber_delta = params.get('huber_delta', 1.0)
-        physics_warmup_epochs = params.get('physics_warmup_epochs', 60)
         lambda_rec = params.get('loss_reciprocity_weight', 0.0)
-        lambda_grad = 0.0
-        lambda_tv = 0.0
-        if reg_type == 'grad':
-            lambda_grad = params.get('loss_smooth_weight', 0.0)
-        elif reg_type == 'tv':
-            lambda_tv = params.get('loss_tv_weight', 0.0)
+        lambda_grad = params.get('loss_smooth_weight', 0.0)
+        lambda_tv = params.get('loss_tv_weight', 0.0)
 
         trial_number = entry.get('number', 0)
         trial_root = ensure_dir(top_root / f"trial_{trial_number:05d}")
@@ -1163,12 +1254,10 @@ def stage6_eval_topk(args, cfg: Dict[str, Any]) -> None:
             overrides.update({
                 'outdir': str(trial_root / f"seed_{seed}"),
                 'seed': seed,
-                'loss_type': 'huber',
                 'huber_delta': huber_delta,
                 'loss_reciprocity_weight': lambda_rec,
                 'loss_smooth_weight': lambda_grad,
                 'loss_tv_weight': lambda_tv,
-                'physics_warmup_epochs': physics_warmup_epochs,
             })
             res = fit_one_trial(cfg, overrides=overrides, trial=None,
                                 force_no_physics=False, force_amp=True, enable_gate=False)
@@ -1245,6 +1334,12 @@ def main():
                     help='Stage6 OOD eval mode: lite uses fixed subset, full uses all')
     ap.add_argument('--stage6-ood-lite-count', type=int, default=64,
                     help='Stage6 lite OOD sample count (fixed subset size)')
+    ap.add_argument('--stage6-reg-mode', type=str, default='grad',
+                    choices=['grad', 'tv', 'grad_tv', 'rec', 'auto'],
+                    help='Stage6 regularization search mode')
+    ap.add_argument('--stage6-autosampler-backend', type=str, default='auto',
+                    choices=['auto', 'optuna', 'optunahub'],
+                    help='Stage6 AutoSampler backend')
     ap.add_argument('--stage6-val-every-epochs', type=int, default=5,
                     help='Stage6 validation frequency (epochs)')
     ap.add_argument('--stage6-highfreq-every-epochs', type=int, default=10,
@@ -1309,7 +1404,7 @@ def main():
         stage5_epoch_tune(args, cfg)
     elif args.stage == 'stage6':
         if args.n_trials == 36:
-            args.n_trials = 24
+            args.n_trials = 12
         args.epochs = 180
         args.limit_files = None
         args.pts_per_map = 8192
