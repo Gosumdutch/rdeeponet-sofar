@@ -862,10 +862,6 @@ def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
     backend = args.stage6_autosampler_backend
     seed = 42
 
-    # TPE fallback option
-    if backend == 'tpe':
-        return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
-
     if backend in ('auto', 'optunahub'):
         try:
             import optunahub
@@ -883,10 +879,7 @@ def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
         auto_sampler_cls = getattr(optuna.samplers, 'AutoSampler', None)
         if auto_sampler_cls is not None:
             return auto_sampler_cls(seed=seed)
-        # Fallback to TPE
-        if backend == 'auto':
-            return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
-        raise RuntimeError("AutoSampler not available. Use --stage6-autosampler-backend tpe")
+        raise RuntimeError("AutoSampler not available. Install optunahub: pip install optunahub")
 
     raise ValueError(f"Unknown stage6 autosampler backend: {backend}")
 
