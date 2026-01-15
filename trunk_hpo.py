@@ -862,50 +862,31 @@ def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
     backend = args.stage6_autosampler_backend
     seed = 42
 
-    # TPE fallback (most reliable)
+    # TPE fallback option
     if backend == 'tpe':
         return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
 
     if backend in ('auto', 'optunahub'):
         try:
             import optunahub
-            if hasattr(optunahub, 'load'):
-                import inspect
-                candidates = ['samplers/auto', 'samplers/AutoSampler', 'samplers/auto_sampler']
-                for ref in candidates:
-                    try:
-                        sampler_obj = optunahub.load(ref)
-                    except Exception:
-                        continue
-                    sampler = sampler_obj
-                    if isinstance(sampler, type):
-                        try:
-                            if 'seed' in inspect.signature(sampler).parameters:
-                                sampler = sampler(seed=seed)
-                            else:
-                                sampler = sampler()
-                        except Exception:
-                            sampler = sampler()
-                    if hasattr(sampler, 'seed'):
-                        sampler.seed = seed
-                    return sampler
-        except Exception:
+            # Use load_module (correct API)
+            mod = optunahub.load_module("samplers/auto_sampler")
+            if hasattr(mod, 'AutoSampler'):
+                return mod.AutoSampler(seed=seed)
+        except Exception as e:
             if backend == 'optunahub':
-                raise
+                raise RuntimeError(f"Failed to load AutoSampler from optunahub: {e}")
+            # Fall through to TPE for 'auto'
 
     if backend in ('auto', 'optuna'):
+        # Try optuna built-in AutoSampler (if exists in future versions)
         auto_sampler_cls = getattr(optuna.samplers, 'AutoSampler', None)
         if auto_sampler_cls is not None:
-            try:
-                import inspect
-                if 'seed' in inspect.signature(auto_sampler_cls).parameters:
-                    return auto_sampler_cls(seed=seed)
-            except Exception:
-                pass
-            return auto_sampler_cls()
-        # Fallback to TPE if AutoSampler not available
-        print("Warning: AutoSampler not available, falling back to TPESampler")
-        return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
+            return auto_sampler_cls(seed=seed)
+        # Fallback to TPE
+        if backend == 'auto':
+            return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
+        raise RuntimeError("AutoSampler not available. Use --stage6-autosampler-backend tpe")
 
     raise ValueError(f"Unknown stage6 autosampler backend: {backend}")
 
@@ -1344,7 +1325,7 @@ def main():
                     choices=['grad', 'tv', 'grad_tv', 'rec', 'auto'],
                     help='Stage6 regularization search mode')
     ap.add_argument('--stage6-autosampler-backend', type=str, default='auto',
-                    choices=['auto', 'optuna', 'optunahub', 'tpe'],
+                    choices=['auto', 'optuna', 'optunahub'],
                     help='Stage6 AutoSampler backend')
     ap.add_argument('--stage6-val-every-epochs', type=int, default=5,
                     help='Stage6 validation frequency (epochs)')
