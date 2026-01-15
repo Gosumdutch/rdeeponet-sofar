@@ -862,6 +862,10 @@ def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
     backend = args.stage6_autosampler_backend
     seed = 42
 
+    # TPE fallback (most reliable)
+    if backend == 'tpe':
+        return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
+
     if backend in ('auto', 'optunahub'):
         try:
             import optunahub
@@ -891,15 +895,17 @@ def build_stage6_sampler(args) -> optuna.samplers.BaseSampler:
 
     if backend in ('auto', 'optuna'):
         auto_sampler_cls = getattr(optuna.samplers, 'AutoSampler', None)
-        if auto_sampler_cls is None:
-            raise RuntimeError("AutoSampler not available. Please upgrade optuna to >= 4.6.")
-        try:
-            import inspect
-            if 'seed' in inspect.signature(auto_sampler_cls).parameters:
-                return auto_sampler_cls(seed=seed)
-        except Exception:
-            pass
-        return auto_sampler_cls()
+        if auto_sampler_cls is not None:
+            try:
+                import inspect
+                if 'seed' in inspect.signature(auto_sampler_cls).parameters:
+                    return auto_sampler_cls(seed=seed)
+            except Exception:
+                pass
+            return auto_sampler_cls()
+        # Fallback to TPE if AutoSampler not available
+        print("Warning: AutoSampler not available, falling back to TPESampler")
+        return TPESampler(seed=seed, multivariate=True, n_startup_trials=5)
 
     raise ValueError(f"Unknown stage6 autosampler backend: {backend}")
 
@@ -1338,7 +1344,7 @@ def main():
                     choices=['grad', 'tv', 'grad_tv', 'rec', 'auto'],
                     help='Stage6 regularization search mode')
     ap.add_argument('--stage6-autosampler-backend', type=str, default='auto',
-                    choices=['auto', 'optuna', 'optunahub'],
+                    choices=['auto', 'optuna', 'optunahub', 'tpe'],
                     help='Stage6 AutoSampler backend')
     ap.add_argument('--stage6-val-every-epochs', type=int, default=5,
                     help='Stage6 validation frequency (epochs)')
